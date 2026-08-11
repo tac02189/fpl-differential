@@ -1,7 +1,9 @@
 // All FPL API access goes through here.
 // Dev: Vite proxy at /fpl-api → fantasy.premierleague.com/api
-// Prod: VITE_FPL_PROXY → Cloudflare Worker passthrough
-const BASE = import.meta.env.VITE_FPL_PROXY || '/fpl-api'
+// Prod: Cloudflare Worker passthrough (see config.js)
+import { WORKER_URL } from '../config'
+
+const BASE = WORKER_URL || '/fpl-api'
 
 const MIN = 60 * 1000
 const mem = new Map()
