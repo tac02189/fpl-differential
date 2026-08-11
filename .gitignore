@@ -1,0 +1,20 @@
+node_modules/
+dist/
+dev-dist/
+
+# secrets — never commit
+.env
+.env.*
+*.env
+*service-account*.json
+*-service-account.json
+firebase-adminsdk*.json
+secrets/
+*.local
+
+# firebase cache
+.firebase/
+
+# editor/os
+.DS_Store
+Thumbs.db

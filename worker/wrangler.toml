@@ -1,0 +1,3 @@
+name = "fpl-proxy"
+main = "fpl-proxy.js"
+compatibility_date = "2026-08-01"

@@ -1,0 +1,15 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Push subscriptions: clients may register/refresh their own subscription doc.
+    // Reads/deletes happen only from the notification cron via the Admin SDK (bypasses rules).
+    match /subscribers/{subId} {
+      allow create, update: if request.resource.data.keys().hasAll(['subscription'])
+        && request.resource.data.subscription is map;
+      allow read, delete: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

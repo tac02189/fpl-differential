@@ -1,0 +1,151 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0a0e0d;
+  --color-panel: #101614;
+  --color-panel2: #16201c;
+  --color-line: #1e2b26;
+  --color-line2: #2a3a34;
+
+  --color-ink: #e9f4ee;
+  --color-dim: #9fb4aa;
+  --color-mute: #5e7169;
+
+  --color-pitch: #00e37f;
+  --color-pitchdark: #00b868;
+  --color-flag: #ff4d5e;
+  --color-warn: #ffb424;
+  --color-live: #2bd9ff;
+
+  /* difficulty ramp — OKLab lightness strictly monotonic (easy=bright → hard=dark),
+     validated for CVD legibility; cells always carry a text label as relief */
+  --color-fdr1: #00e37f;
+  --color-fdr2: #35a46b;
+  --color-fdr3: #67736b;
+  --color-fdr4: #8c3242;
+  --color-fdr5: #641a2a;
+
+  --font-display: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --font-body: "Barlow", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+html {
+  background: var(--color-bg);
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+}
+
+/* monitor scanline texture */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(233, 244, 238, 0.028) 0px,
+      rgba(233, 244, 238, 0.028) 1px,
+      transparent 1px,
+      transparent 4px
+    );
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+/* ---- shared component classes ---- */
+
+.card {
+  background: var(--color-panel);
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+}
+
+.label {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-mute);
+}
+
+.display {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* corner ticks — instrument styling for hero cards */
+.ticks {
+  position: relative;
+}
+.ticks::before,
+.ticks::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-color: var(--color-pitch);
+  border-style: solid;
+  opacity: 0.7;
+}
+.ticks::before {
+  top: -1px;
+  left: -1px;
+  border-width: 2px 0 0 2px;
+}
+.ticks::after {
+  bottom: -1px;
+  right: -1px;
+  border-width: 0 2px 2px 0;
+}
+
+.pulse-dot {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise {
+  animation: rise 0.35s ease-out both;
+}
+
+/* FDR cells — bg + legible text pairing per step */
+.fdr-1 { background: var(--color-fdr1); color: #07130d; }
+.fdr-2 { background: var(--color-fdr2); color: #07130d; }
+.fdr-3 { background: var(--color-fdr3); color: #eef5f1; }
+.fdr-4 { background: var(--color-fdr4); color: #f5eef0; }
+.fdr-5 { background: var(--color-fdr5); color: #f5eef0; }
+
+/* hide scrollbars on horizontal scrollers, keep function */
+.no-bar {
+  scrollbar-width: none;
+}
+.no-bar::-webkit-scrollbar {
+  display: none;
+}
