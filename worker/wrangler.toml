@@ -1,3 +1,12 @@
 name = "fpl-proxy"
 main = "fpl-proxy.js"
 compatibility_date = "2026-08-01"
+
+# One-time at deploy (after `npx wrangler login`):
+#   npx wrangler kv namespace create SUBS    → paste the printed id below and uncomment
+#   npx wrangler secret put SUBS_SECRET      → value is in ../secrets/local-notes.md
+#   npx wrangler deploy
+#
+# [[kv_namespaces]]
+# binding = "SUBS"
+# id = "PASTE_ID_HERE"

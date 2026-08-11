@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
-import { X } from 'lucide-react'
+import { BellOff, BellRing, X } from 'lucide-react'
 import { useSettings } from '../state/SettingsContext'
+import { disablePush, enablePush, getSubscription, pushSupported } from '../lib/push'
 
 function Field({ label, help, value, onChange, placeholder }) {
   return (
@@ -22,18 +23,46 @@ export default function SettingsSheet() {
   const { settings, update, sheetOpen, closeSheet } = useSettings()
   const [teamId, setTeamId] = useState(settings.teamId)
   const [leagueId, setLeagueId] = useState(settings.leagueId)
+  const [push, setPush] = useState('unknown') // on | off | busy | unavailable
+  const [pushError, setPushError] = useState(null)
 
   useEffect(() => {
     if (sheetOpen) {
       setTeamId(settings.teamId)
       setLeagueId(settings.leagueId)
+      setPushError(null)
+      if (!pushSupported()) setPush('unavailable')
+      else
+        getSubscription().then(
+          s => setPush(s ? 'on' : 'off'),
+          () => setPush('off'),
+        )
     }
   }, [sheetOpen]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!sheetOpen) return null
 
+  const togglePush = async () => {
+    setPushError(null)
+    setPush('busy')
+    try {
+      if (push === 'on') {
+        await disablePush()
+        setPush('off')
+      } else {
+        await enablePush(teamId)
+        setPush('on')
+      }
+    } catch (e) {
+      setPushError(e.message)
+      getSubscription().then(s => setPush(s ? 'on' : 'off'))
+    }
+  }
+
   const save = () => {
     update({ teamId, leagueId })
+    // keep the alert registration pointed at the latest team ID
+    if (push === 'on') enablePush(teamId).catch(() => {})
     closeSheet()
   }
 
@@ -65,6 +94,38 @@ export default function SettingsSheet() {
             placeholder="e.g. 98765"
             help="Open your league's standings — the number in the URL after /leagues/. Classic leagues only."
           />
+          <div>
+            <span className="label">Alerts</span>
+            {push === 'unavailable' ? (
+              <p className="mt-1.5 text-[0.72rem] leading-snug text-mute">
+                Push alerts activate on the deployed app. On iPhone, add it to your Home Screen first.
+              </p>
+            ) : (
+              <>
+                <button
+                  onClick={togglePush}
+                  disabled={push === 'busy' || push === 'unknown'}
+                  className={`mt-1.5 flex w-full items-center justify-center gap-2 rounded-lg border py-2.5 text-sm font-medium transition-colors ${
+                    push === 'on'
+                      ? 'border-pitch/50 bg-pitch/10 text-pitch'
+                      : 'border-line bg-panel2 text-ink active:bg-panel'
+                  }`}
+                >
+                  {push === 'on' ? <BellRing size={15} /> : <BellOff size={15} />}
+                  {push === 'busy'
+                    ? 'Working…'
+                    : push === 'on'
+                      ? 'Alerts on — tap to disable'
+                      : 'Enable deadline & injury alerts'}
+                </button>
+                <p className="mt-1 text-[0.72rem] leading-snug text-mute">
+                  Deadline reminders 24h and 2h out, plus injury news on your players. iPhone needs the app installed
+                  to the Home Screen.
+                </p>
+                {pushError && <p className="mt-1 text-[0.72rem] text-flag">{pushError}</p>}
+              </>
+            )}
+          </div>
           <button
             onClick={save}
             className="display w-full rounded-lg bg-pitch py-3 text-base tracking-widest text-[#07130d] active:bg-pitchdark"

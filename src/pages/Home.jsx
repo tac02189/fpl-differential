@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ArrowDown, ArrowUp, Link2 } from 'lucide-react'
-import { ctxFrom, getBootstrap, getEntry, getHistory, getPicks } from '../api/fpl'
+import { ctxFrom, getBootstrap, getEntry, getHistory, getLive, getLiveFixtures, getPicks } from '../api/fpl'
 import { useAsync } from '../lib/useAsync'
 import { useSettings } from '../state/SettingsContext'
 import { countdown, fmtDeadline, fmtK, fmtRank, money } from '../lib/format'
@@ -63,6 +63,73 @@ function ChipTracker({ defs, used }) {
   )
 }
 
+// FPL tie rules: 3/2/1 by BPS rank per fixture, ties share the higher award
+function provisionalBonus(fixtures) {
+  const bonus = new Map()
+  for (const f of fixtures || []) {
+    if (!f.started || f.finished) continue
+    const bps = (f.stats || []).find(s => s.identifier === 'bps')
+    if (!bps) continue
+    const all = [...(bps.h || []), ...(bps.a || [])].sort((a, b) => b.value - a.value)
+    let award = [3, 2, 1]
+    let i = 0
+    while (i < all.length && award.length > 0) {
+      const tied = all.filter(x => x.value === all[i].value)
+      for (const t of tied) bonus.set(t.element, (bonus.get(t.element) || 0) + award[0])
+      award = award.slice(tied.length)
+      i += tied.length
+    }
+  }
+  return bonus
+}
+
+function LivePanel({ ctx, picks, live, liveFx }) {
+  const stats = new Map((live.elements || []).map(e => [e.id, e.stats]))
+  const bonus = provisionalBonus(liveFx)
+  const rows = [...picks].sort((a, b) => a.position - b.position)
+  let total = 0
+  let pendingBp = 0
+  const items = rows.map(pk => {
+    const p = ctx.players.get(pk.element)
+    const s = stats.get(pk.element) || {}
+    const pts = (s.total_points || 0) * pk.multiplier
+    const bp = (bonus.get(pk.element) || 0) * pk.multiplier
+    total += pts
+    pendingBp += bp
+    return { pk, p, s, bp }
+  })
+  return (
+    <div className="card ticks overflow-hidden">
+      <div className="flex items-baseline justify-between px-4 pt-3.5">
+        <span className="mono text-[2.1rem] font-semibold leading-none text-live">{total}</span>
+        <span className="text-[0.7rem] text-dim">{pendingBp > 0 ? `+${pendingBp} bonus pending` : 'live points'}</span>
+      </div>
+      <ul className="mt-3 divide-y divide-line border-t border-line">
+        {items.map(({ pk, p, s, bp }) => {
+          if (!p) return null
+          const bench = pk.multiplier === 0
+          return (
+            <li key={pk.element} className={`flex items-center gap-2 px-4 py-1.5 ${bench ? 'opacity-50' : ''}`}>
+              <span className="min-w-0 flex-1 truncate text-[0.85rem] font-medium">
+                {p.web_name}
+                {pk.is_captain && <span className="text-pitch"> (C)</span>}
+              </span>
+              {bp > 0 && <span className="mono text-[0.66rem] text-live">+{bp}bp</span>}
+              <span className="mono w-8 text-right text-[0.7rem] text-mute">{s.minutes ?? 0}′</span>
+              <span className="mono w-8 text-right text-[0.9rem] font-semibold">
+                {(s.total_points || 0) * (pk.multiplier || 1)}
+              </span>
+            </li>
+          )
+        })}
+      </ul>
+      <p className="px-4 py-2 text-[0.64rem] leading-snug text-mute">
+        Provisional — bench autosubs and final bonus apply when the gameweek is settled.
+      </p>
+    </div>
+  )
+}
+
 function SquadList({ picks, ctx }) {
   const byId = ctx.players
   const rows = [...picks].sort((a, b) => a.position - b.position)
@@ -112,6 +179,11 @@ export default function Home() {
   const history = useAsync(() => getHistory(teamId), [teamId], { enabled: !!teamId })
   const picks = useAsync(() => getPicks(teamId, gw), [teamId, gw], { enabled: !!(teamId && gw) })
 
+  // an unfinished current GW = matches in play or upcoming this week → live scoring
+  const liveActive = !!(ctx?.current && !ctx.current.finished && gw)
+  const live = useAsync(() => getLive(gw), [gw], { enabled: liveActive, poll: 60_000 })
+  const liveFx = useAsync(() => getLiveFixtures(gw), [gw], { enabled: liveActive, poll: 120_000 })
+
   if (boot.loading) return <Spinner label="Reading the game state" />
   if (boot.error || !ctx) return <ErrorNote />
 
@@ -120,6 +192,26 @@ export default function Home() {
 
   return (
     <div className="space-y-5">
+      {liveActive && teamId && (
+        <Section
+          title={`GW${gw} live`}
+          right={
+            <span className="flex items-center gap-1.5 text-[0.66rem] font-medium tracking-widest text-live">
+              <span className="pulse-dot inline-block h-1.5 w-1.5 rounded-full bg-live" />
+              LIVE
+            </span>
+          }
+        >
+          {picks.data && live.data ? (
+            <LivePanel ctx={ctx} picks={picks.data.picks} live={live.data} liveFx={liveFx.data} />
+          ) : picks.loading || live.loading ? (
+            <Spinner label="Fetching live points" />
+          ) : (
+            <div className="card px-4 py-3 text-sm text-dim">Live points appear once the deadline passes.</div>
+          )}
+        </Section>
+      )}
+
       <Section title="Next deadline">
         <DeadlineHero next={ctx.next} />
       </Section>

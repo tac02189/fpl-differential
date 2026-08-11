@@ -1,0 +1,28 @@
+name: notifications
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Send a test push to all subscribers
+        type: boolean
+        default: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-save --no-audit --no-fund web-push
+      - run: node scripts/notify.mjs
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          SUBS_SECRET: ${{ secrets.SUBS_SECRET }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          TEST_PUSH: ${{ inputs.test }}
