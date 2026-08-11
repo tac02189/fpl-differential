@@ -12,6 +12,9 @@ self.addEventListener('push', event => {
       icon: '/pwa-192x192.png',
       badge: '/pwa-64x64.png',
       tag: d.tag || 'fpl-differential',
+      // without renotify, a same-tag follow-up (e.g. doubtful → ruled out) would
+      // replace the old notification silently — no sound, no banner
+      renotify: true,
       data: { url: d.url || '/' },
     }),
   )

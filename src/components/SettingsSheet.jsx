@@ -59,10 +59,30 @@ export default function SettingsSheet() {
     }
   }
 
-  const save = () => {
+  const save = async () => {
     update({ teamId, leagueId })
-    // keep the alert registration pointed at the latest team ID
-    if (push === 'on') enablePush(teamId).catch(() => {})
+    // keep the alert registration pointed at the latest team ID; decide from the
+    // real subscription (not the async UI state, which may still be 'unknown')
+    let sub = null
+    if (pushSupported()) {
+      try {
+        sub = await getSubscription()
+      } catch {
+        sub = null
+      }
+    }
+    if (sub) {
+      setPush('busy')
+      try {
+        await enablePush(teamId)
+        setPush('on')
+      } catch (e) {
+        // keep the sheet open so the failure is actually seen
+        setPush('on')
+        setPushError(`Saved, but alert re-registration failed: ${e.message}`)
+        return
+      }
+    }
     closeSheet()
   }
 

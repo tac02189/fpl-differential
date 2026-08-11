@@ -18,16 +18,29 @@ export async function enablePush(teamId) {
   const perm = await Notification.requestPermission()
   if (perm !== 'granted') throw new Error('Notifications are blocked — allow them in your browser settings.')
   const reg = await navigator.serviceWorker.ready
-  const sub = await reg.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: b64ToU8(VAPID_PUBLIC_KEY),
-  })
-  const res = await fetch(`${WORKER_URL}/subscribe`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ subscription: sub.toJSON(), teamId: teamId || null }),
-  })
-  if (!res.ok) throw new Error('Could not register with the alert service — try again shortly.')
+  const existing = await reg.pushManager.getSubscription()
+  const sub =
+    existing ||
+    (await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: b64ToU8(VAPID_PUBLIC_KEY),
+    }))
+  let res = null
+  try {
+    res = await fetch(`${WORKER_URL}/subscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscription: sub.toJSON(), teamId: teamId || null }),
+    })
+  } catch {
+    res = null
+  }
+  if (!res || !res.ok) {
+    // a brand-new subscription the server never learned about must not linger —
+    // the UI would read it as "alerts on" while no push could ever arrive
+    if (!existing) await sub.unsubscribe().catch(() => {})
+    throw new Error('Could not register with the alert service — try again shortly.')
+  }
   return sub
 }
 

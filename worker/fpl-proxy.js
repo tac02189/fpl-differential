@@ -20,6 +20,25 @@ async function subKey(endpoint) {
   return 'sub:' + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
+// only real browser push services — rejects junk endpoints outright
+function validPushEndpoint(ep) {
+  if (typeof ep !== 'string') return false
+  try {
+    const u = new URL(ep)
+    if (u.protocol !== 'https:') return false
+    const h = u.hostname
+    return (
+      h === 'fcm.googleapis.com' ||
+      h === 'updates.push.services.mozilla.com' ||
+      h === 'web.push.apple.com' ||
+      h.endsWith('.push.apple.com') ||
+      h.endsWith('.notify.windows.com')
+    )
+  } catch {
+    return false
+  }
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url)
@@ -30,11 +49,26 @@ export default {
     if (url.pathname === '/subscribe' && req.method === 'POST') {
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
       const body = await req.json().catch(() => null)
-      if (!body?.subscription?.endpoint) return json({ error: 'bad subscription' }, 400)
-      await env.SUBS.put(
-        await subKey(body.subscription.endpoint),
-        JSON.stringify({ subscription: body.subscription, teamId: body.teamId || null, t: Date.now() }),
-      )
+      if (!validPushEndpoint(body?.subscription?.endpoint)) return json({ error: 'bad subscription' }, 400)
+      const key = await subKey(body.subscription.endpoint)
+      const existing = await env.SUBS.get(key)
+      const core = JSON.stringify({ subscription: body.subscription, teamId: body.teamId || null })
+      if (existing) {
+        // identical re-registration: skip the KV write (KV writes are the scarce quota)
+        try {
+          const prev = JSON.parse(existing)
+          if (JSON.stringify({ subscription: prev.subscription, teamId: prev.teamId }) === core) {
+            return json({ ok: true })
+          }
+        } catch {
+          /* unreadable previous value — overwrite it */
+        }
+      } else {
+        // cap stored subscriptions so junk POSTs can't flood KV or the push cron
+        const list = await env.SUBS.list({ prefix: 'sub:', limit: 25 })
+        if (list.keys.length >= 20) return json({ error: 'subscription limit reached' }, 429)
+      }
+      await env.SUBS.put(key, JSON.stringify({ subscription: body.subscription, teamId: body.teamId || null, t: Date.now() }))
       return json({ ok: true })
     }
 
@@ -73,17 +107,20 @@ export default {
     if (req.method !== 'GET') return new Response('Method not allowed', { status: 405 })
     if (!ALLOW.test(url.pathname)) return new Response('Not found', { status: 404 })
 
+    // live-scoring endpoints get a much shorter cache so goals don't lag minutes behind
+    const isLive =
+      url.pathname.startsWith('/event/') || (url.pathname.startsWith('/fixtures') && url.searchParams.has('event'))
     const upstream = `https://fantasy.premierleague.com/api${url.pathname}${url.search}`
     const res = await fetch(upstream, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (compatible; fpl-differential personal app)',
         Accept: 'application/json',
       },
-      cf: { cacheTtl: 60, cacheEverything: true },
+      cf: { cacheTtl: isLive ? 20 : 60, cacheEverything: true },
     })
     const headers = new Headers(res.headers)
     headers.set('Access-Control-Allow-Origin', '*')
-    headers.set('Cache-Control', 'public, max-age=60')
+    headers.set('Cache-Control', `public, max-age=${isLive ? 10 : 60}`)
     return new Response(res.body, { status: res.status, headers })
   },
 }

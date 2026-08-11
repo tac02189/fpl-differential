@@ -65,8 +65,10 @@ export const getFixtures = () => cached('fpl.fixtures.v1', 'fixtures/', 30 * MIN
 export const getEntry = id => cached(`fpl.entry.${id}`, `entry/${id}/`, 5 * MIN)
 export const getHistory = id => cached(`fpl.history.${id}`, `entry/${id}/history/`, 5 * MIN)
 export const getPicks = (id, gw) => cached(`fpl.picks.${id}.${gw}`, `entry/${id}/event/${gw}/picks/`, 5 * MIN)
-export const getLive = gw => cached(`fpl.live.${gw}`, `event/${gw}/live/`, MIN)
-export const getLiveFixtures = gw => cached(`fpl.fx.${gw}`, `fixtures/?event=${gw}`, MIN)
+// live endpoints: TTL must stay well under the UI poll interval (60s/120s in Home),
+// or every other poll is a cache no-op and "live" scores lag by whole minutes
+export const getLive = gw => cached(`fpl.live.${gw}`, `event/${gw}/live/`, 25_000)
+export const getLiveFixtures = gw => cached(`fpl.fx.${gw}`, `fixtures/?event=${gw}`, 25_000)
 export const getLeague = (id, page = 1) =>
   cached(`fpl.league.${id}.${page}`, `leagues-classic/${id}/standings/?page_standings=${page}`, 5 * MIN)
 export const getElementSummary = id => cached(`fpl.el.${id}`, `element-summary/${id}/`, 30 * MIN)

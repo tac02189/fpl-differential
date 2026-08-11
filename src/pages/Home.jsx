@@ -83,7 +83,7 @@ function provisionalBonus(fixtures) {
   return bonus
 }
 
-function LivePanel({ ctx, picks, live, liveFx }) {
+function LivePanel({ ctx, picks, hits, live, liveFx }) {
   const stats = new Map((live.elements || []).map(e => [e.id, e.stats]))
   const bonus = provisionalBonus(liveFx)
   const rows = [...picks].sort((a, b) => a.position - b.position)
@@ -98,11 +98,20 @@ function LivePanel({ ctx, picks, live, liveFx }) {
     pendingBp += bp
     return { pk, p, s, bp }
   })
+  const net = total - (hits || 0)
   return (
     <div className="card ticks overflow-hidden">
       <div className="flex items-baseline justify-between px-4 pt-3.5">
-        <span className="mono text-[2.1rem] font-semibold leading-none text-live">{total}</span>
-        <span className="text-[0.7rem] text-dim">{pendingBp > 0 ? `+${pendingBp} bonus pending` : 'live points'}</span>
+        <span className="mono text-[2.1rem] font-semibold leading-none text-live">{net}</span>
+        <span className="text-right text-[0.7rem] leading-snug text-dim">
+          {pendingBp > 0 ? `+${pendingBp} bonus pending` : 'live points'}
+          {hits > 0 && (
+            <>
+              <br />
+              <span className="text-flag">−{hits} transfer hit{hits > 4 ? 's' : ''}</span>
+            </>
+          )}
+        </span>
       </div>
       <ul className="mt-3 divide-y divide-line border-t border-line">
         {items.map(({ pk, p, s, bp }) => {
@@ -203,7 +212,13 @@ export default function Home() {
           }
         >
           {picks.data && live.data ? (
-            <LivePanel ctx={ctx} picks={picks.data.picks} live={live.data} liveFx={liveFx.data} />
+            <LivePanel
+              ctx={ctx}
+              picks={picks.data.picks}
+              hits={picks.data.entry_history?.event_transfers_cost || 0}
+              live={live.data}
+              liveFx={liveFx.data}
+            />
           ) : picks.loading || live.loading ? (
             <Spinner label="Fetching live points" />
           ) : (

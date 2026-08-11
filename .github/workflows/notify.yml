@@ -1,5 +1,11 @@
 name: notifications
 
+# never run two instances at once — overlapping runs double-send reminders
+# and clobber each other's dedup state
+concurrency:
+  group: notify
+  cancel-in-progress: false
+
 on:
   schedule:
     - cron: '*/30 * * * *'
