@@ -18,6 +18,8 @@
   "devDependencies": {
     "@tailwindcss/vite": "latest",
     "@vitejs/plugin-react": "latest",
+    "sharp": "^0.35.3",
+    "sharp-ico": "^0.1.5",
     "tailwindcss": "latest",
     "vite": "latest",
     "vite-plugin-pwa": "latest"

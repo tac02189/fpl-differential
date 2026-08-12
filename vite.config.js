@@ -9,7 +9,7 @@ export default defineConfig({
     tailwindcss(),
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: ['icon.svg'],
+      includeAssets: ['favicon.ico', 'apple-touch-icon-180x180.png', 'og.png'],
       manifest: {
         name: 'FPL Differential',
         short_name: 'FPL Ddx',
