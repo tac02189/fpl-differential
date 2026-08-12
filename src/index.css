@@ -1,29 +1,36 @@
 @import "tailwindcss";
 
+/* Broadsheet — white surface, Premier League purple as the structural accent,
+   green reserved for data-positive signals (ownership, price rises, availability). */
 @theme {
-  --color-bg: #0a0e0d;
-  --color-panel: #101614;
-  --color-panel2: #16201c;
-  --color-line: #1e2b26;
-  --color-line2: #2a3a34;
+  --color-bg: #ffffff;
+  --color-panel: #ffffff;
+  --color-panel2: #f5f2f8;
+  --color-line: #e4deea;
+  --color-line2: #cfc5d8;
 
-  --color-ink: #e9f4ee;
-  --color-dim: #9fb4aa;
-  --color-mute: #5e7169;
+  --color-ink: #1f1330;
+  --color-dim: #6a5e7a;
+  --color-mute: #756b82;
 
-  --color-pitch: #00e37f;
-  --color-pitchdark: #00b868;
-  --color-flag: #ff4d5e;
-  --color-warn: #ffb424;
-  --color-live: #2bd9ff;
+  --color-brand: #38003c;
+  --color-branddark: #24002a;
 
-  /* difficulty ramp — OKLab lightness strictly monotonic (easy=bright → hard=dark),
-     validated for CVD legibility; cells always carry a text label as relief */
-  --color-fdr1: #00e37f;
-  --color-fdr2: #35a46b;
-  --color-fdr3: #67736b;
-  --color-fdr4: #8c3242;
-  --color-fdr5: #641a2a;
+  --color-pitch: #00784b;
+  --color-pitchdark: #005e3b;
+  --color-pitchbright: #00915a;
+
+  --color-flag: #c62839;
+  --color-warn: #a8690a;
+  --color-live: #0a72a6;
+
+  /* difficulty ramp — diverging (easy green → neutral → hard red), validated on
+     white for colorblind separation; every cell also carries a text label */
+  --color-fdr1: #197a51;
+  --color-fdr2: #68c69a;
+  --color-fdr3: #f2eff5;
+  --color-fdr4: #ee7386;
+  --color-fdr5: #9e1f36;
 
   --font-display: "Barlow Condensed", "Arial Narrow", sans-serif;
   --font-body: "Barlow", sans-serif;
@@ -43,26 +50,8 @@ body {
   overscroll-behavior-y: none;
 }
 
-/* monitor scanline texture */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  background:
-    repeating-linear-gradient(
-      to bottom,
-      rgba(233, 244, 238, 0.028) 0px,
-      rgba(233, 244, 238, 0.028) 1px,
-      transparent 1px,
-      transparent 4px
-    );
-}
-
 #root {
   position: relative;
-  z-index: 1;
 }
 
 /* ---- shared component classes ---- */
@@ -104,9 +93,9 @@ body::before {
   position: absolute;
   width: 10px;
   height: 10px;
-  border-color: var(--color-pitch);
+  border-color: var(--color-brand);
   border-style: solid;
-  opacity: 0.7;
+  opacity: 0.85;
 }
 .ticks::before {
   top: -1px;
@@ -135,12 +124,12 @@ body::before {
   animation: rise 0.35s ease-out both;
 }
 
-/* FDR cells — bg + legible text pairing per step */
-.fdr-1 { background: var(--color-fdr1); color: #07130d; }
-.fdr-2 { background: var(--color-fdr2); color: #07130d; }
-.fdr-3 { background: var(--color-fdr3); color: #eef5f1; }
-.fdr-4 { background: var(--color-fdr4); color: #f5eef0; }
-.fdr-5 { background: var(--color-fdr5); color: #f5eef0; }
+/* FDR cells — bg + AA-contrast text pairing per step */
+.fdr-1 { background: var(--color-fdr1); color: #ffffff; }
+.fdr-2 { background: var(--color-fdr2); color: #08351f; }
+.fdr-3 { background: var(--color-fdr3); color: #494154; }
+.fdr-4 { background: var(--color-fdr4); color: #5c0d1a; }
+.fdr-5 { background: var(--color-fdr5); color: #ffffff; }
 
 /* hide scrollbars on horizontal scrollers, keep function */
 .no-bar {

@@ -73,7 +73,7 @@ export default function Rivals() {
         </p>
         <button
           onClick={openSheet}
-          className="display inline-flex items-center gap-2 rounded-lg bg-pitch px-4 py-2 text-sm tracking-widest text-[#07130d] active:bg-pitchdark"
+          className="display inline-flex items-center gap-2 rounded-lg bg-brand px-4 py-2 text-sm tracking-widest text-white active:bg-branddark"
         >
           <Link2 size={15} /> Add league ID
         </button>
@@ -93,12 +93,12 @@ export default function Rivals() {
             return (
               <li
                 key={r.entry}
-                className={`flex items-center gap-2 px-3 py-2 ${me ? 'bg-pitch/[0.07]' : ''}`}
+                className={`flex items-center gap-2 px-3 py-2 ${me ? 'bg-brand/[0.06]' : ''}`}
               >
                 <span className="mono w-5 shrink-0 text-right text-[0.78rem] text-dim">{r.rank}</span>
                 <Movement rank={r.rank} last={r.last_rank} />
                 <div className="min-w-0 flex-1">
-                  <div className={`truncate text-[0.88rem] ${me ? 'font-semibold text-pitch' : 'font-medium'}`}>
+                  <div className={`truncate text-[0.88rem] ${me ? 'font-semibold text-brand' : 'font-medium'}`}>
                     {r.entry_name}
                   </div>
                   <div className="truncate text-[0.66rem] text-mute">{r.player_name}</div>

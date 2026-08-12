@@ -64,7 +64,7 @@ export const Chip = ({ active, onClick, children }) => (
     onClick={onClick}
     className={`shrink-0 rounded-full border px-3 py-1 text-[0.72rem] font-medium transition-colors ${
       active
-        ? 'border-pitch/60 bg-pitch/15 text-pitch'
+        ? 'border-brand/50 bg-brand/10 text-brand'
         : 'border-line bg-panel text-dim active:bg-panel2'
     }`}
   >

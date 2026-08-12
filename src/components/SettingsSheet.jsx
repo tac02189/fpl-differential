@@ -12,7 +12,7 @@ function Field({ label, help, value, onChange, placeholder }) {
         onChange={e => onChange(e.target.value.replace(/\D/g, ''))}
         inputMode="numeric"
         placeholder={placeholder}
-        className="mono mt-1.5 w-full rounded-lg border border-line bg-panel2 px-3 py-2.5 text-base text-ink outline-none placeholder:text-mute focus:border-pitch/60"
+        className="mono mt-1.5 w-full rounded-lg border border-line bg-panel2 px-3 py-2.5 text-base text-ink outline-none placeholder:text-mute focus:border-brand/60"
       />
       <span className="mt-1 block text-[0.72rem] leading-snug text-mute">{help}</span>
     </label>
@@ -88,7 +88,7 @@ export default function SettingsSheet() {
 
   return (
     <div className="fixed inset-0 z-30">
-      <div className="absolute inset-0 bg-black/60" onClick={closeSheet} />
+      <div className="absolute inset-0 bg-ink/40" onClick={closeSheet} />
       <div
         className="rise absolute inset-x-0 bottom-0 mx-auto max-w-md rounded-t-2xl border-t border-line bg-panel px-5 pt-4"
         style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 20px)' }}
@@ -127,7 +127,7 @@ export default function SettingsSheet() {
                   disabled={push === 'busy' || push === 'unknown'}
                   className={`mt-1.5 flex w-full items-center justify-center gap-2 rounded-lg border py-2.5 text-sm font-medium transition-colors ${
                     push === 'on'
-                      ? 'border-pitch/50 bg-pitch/10 text-pitch'
+                      ? 'border-pitch/50 bg-pitch/[0.08] text-pitch'
                       : 'border-line bg-panel2 text-ink active:bg-panel'
                   }`}
                 >
@@ -148,7 +148,7 @@ export default function SettingsSheet() {
           </div>
           <button
             onClick={save}
-            className="display w-full rounded-lg bg-pitch py-3 text-base tracking-widest text-[#07130d] active:bg-pitchdark"
+            className="display w-full rounded-lg bg-brand py-3 text-base tracking-widest text-white active:bg-branddark"
           >
             Save
           </button>

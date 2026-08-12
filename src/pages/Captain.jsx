@@ -62,7 +62,7 @@ export default function Captain() {
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[0.95rem] font-semibold leading-tight">{p.web_name}</span>
                     {pk?.is_captain && (
-                      <span className="mono rounded bg-pitch px-1 text-[0.6rem] font-semibold text-[#07130d]">C</span>
+                      <span className="mono rounded bg-pitch px-1 text-[0.6rem] font-semibold text-white">C</span>
                     )}
                     {pk?.is_vice_captain && (
                       <span className="mono rounded bg-panel2 px-1 text-[0.6rem] text-dim">V</span>
@@ -83,7 +83,7 @@ export default function Captain() {
                     )}
                   </div>
                   <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-panel2">
-                    <div className="h-full rounded-full bg-pitch" style={{ width: `${(score / view.max) * 100}%` }} />
+                    <div className="h-full rounded-full bg-pitchbright" style={{ width: `${(score / view.max) * 100}%` }} />
                   </div>
                 </div>
                 <div className="shrink-0 text-right">

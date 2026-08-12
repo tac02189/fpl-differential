@@ -23,7 +23,7 @@ function DeadlineHero({ next }) {
         <span className="display text-2xl">GW{next.id}</span>
         <span className="label">deadline</span>
       </div>
-      <div className="mono mt-1.5 text-[2.3rem] font-semibold leading-none text-pitch">
+      <div className="mono mt-1.5 text-[2.3rem] font-semibold leading-none text-brand">
         {cd.d}d {String(cd.h).padStart(2, '0')}h {String(cd.m).padStart(2, '0')}m
       </div>
       <div className="mt-2 text-sm text-dim">{fmtDeadline(next.deadline_time)} · your time</div>
@@ -156,7 +156,7 @@ function SquadList({ picks, ctx }) {
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <span className="truncate text-[0.9rem] font-medium">{p.web_name}</span>
-                {pk.is_captain && <span className="mono rounded bg-pitch px-1 text-[0.6rem] font-semibold text-[#07130d]">C</span>}
+                {pk.is_captain && <span className="mono rounded bg-pitch px-1 text-[0.6rem] font-semibold text-white">C</span>}
                 {pk.is_vice_captain && <span className="mono rounded bg-panel2 px-1 text-[0.6rem] text-dim">V</span>}
                 <span className="text-[0.68rem] text-mute">{ctx.teams.get(p.team)?.short_name}</span>
               </div>
@@ -240,7 +240,7 @@ export default function Home() {
           </p>
           <button
             onClick={openSheet}
-            className="display inline-flex items-center gap-2 rounded-lg bg-pitch px-4 py-2 text-sm tracking-widest text-[#07130d] active:bg-pitchdark"
+            className="display inline-flex items-center gap-2 rounded-lg bg-brand px-4 py-2 text-sm tracking-widest text-white active:bg-branddark"
           >
             <Link2 size={15} /> Add team ID
           </button>

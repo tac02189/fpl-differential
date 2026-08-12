@@ -23,10 +23,10 @@ export default function TabBar({ tab, onChange }) {
               onClick={() => onChange(id)}
               aria-current={active ? 'page' : undefined}
               className={`relative flex flex-col items-center gap-0.5 py-2.5 ${
-                active ? 'text-pitch' : 'text-mute active:text-dim'
+                active ? 'text-brand' : 'text-mute active:text-dim'
               }`}
             >
-              {active && <span className="absolute top-0 h-[2px] w-8 rounded-full bg-pitch" />}
+              {active && <span className="absolute top-0 h-[2px] w-8 rounded-full bg-brand" />}
               <Icon size={19} strokeWidth={active ? 2.2 : 1.8} />
               <span className="label !text-[0.58rem] !tracking-[0.12em] !text-current">{label}</span>
             </button>

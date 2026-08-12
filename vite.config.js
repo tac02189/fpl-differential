@@ -14,8 +14,8 @@ export default defineConfig({
         name: 'FPL Differential',
         short_name: 'FPL Ddx',
         description: 'Differential-hunting companion for Fantasy Premier League',
-        theme_color: '#0A0E0D',
-        background_color: '#0A0E0D',
+        theme_color: '#ffffff',
+        background_color: '#ffffff',
         display: 'standalone',
         start_url: '/',
         icons: [
