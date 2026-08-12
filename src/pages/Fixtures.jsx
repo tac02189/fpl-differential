@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { ctxFrom, getBootstrap, getFixtures } from '../api/fpl'
 import { useAsync } from '../lib/useAsync'
-import { fixtureRun, strengthBander } from '../lib/metrics'
+import { fixtureRun, hasStrengthSplits, strengthBander } from '../lib/metrics'
 import { Chip, ErrorNote, Spinner } from '../components/Bits'
 
 const MODES = [
@@ -18,13 +18,25 @@ export default function Fixtures() {
 
   const ctx = useMemo(() => (boot.data ? ctxFrom(boot.data) : null), [boot.data])
 
+  // FPL publishes attack/defence ratings only once the season is underway, and
+  // may publish one side before the other — so check each mode independently
+  const ready = useMemo(
+    () => ({
+      fdr: true,
+      att: ctx ? hasStrengthSplits(ctx.teams, 'att') : false,
+      def: ctx ? hasStrengthSplits(ctx.teams, 'def') : false,
+    }),
+    [ctx],
+  )
+  const activeMode = ready[mode] ? mode : 'fdr'
+
   const view = useMemo(() => {
     if (!ctx || !fx.data) return null
     const start = ctx.next?.id ?? 38
     const events = []
     for (let e = start; e <= Math.min(38, start + 5); e++) events.push(e)
     const last = events[events.length - 1]
-    const bander = mode === 'fdr' ? null : strengthBander(ctx.teams, mode)
+    const bander = activeMode === 'fdr' ? null : strengthBander(ctx.teams, activeMode)
     const rows = [...ctx.teams.values()].map(t => {
       const run = fixtureRun(fx.data, t.id, start, 99).filter(f => f.event <= last)
       const cells = events.map(e =>
@@ -37,7 +49,7 @@ export default function Fixtures() {
     })
     rows.sort(byEase ? (a, b) => b.easeSum - a.easeSum : (a, b) => a.t.short_name.localeCompare(b.t.short_name))
     return { events, rows }
-  }, [ctx, fx.data, mode, byEase])
+  }, [ctx, fx.data, activeMode, byEase])
 
   if (boot.loading || fx.loading) return <Spinner label="Charting the run-ins" />
   if (boot.error || fx.error || !view) return <ErrorNote />
@@ -45,17 +57,37 @@ export default function Fixtures() {
   return (
     <div>
       <div className="mb-2 flex items-center gap-1.5">
-        {MODES.map(m => (
-          <Chip key={m.id} active={mode === m.id} onClick={() => setMode(m.id)}>
-            {m.label}
-          </Chip>
-        ))}
+        {MODES.map(m => {
+          const locked = !ready[m.id]
+          return (
+            <Chip
+              key={m.id}
+              active={activeMode === m.id}
+              disabled={locked}
+              onClick={() => setMode(m.id)}
+              title={locked ? 'FPL publishes attack/defence ratings once the season starts' : undefined}
+            >
+              {m.label}
+            </Chip>
+          )
+        })}
         <div className="flex-1" />
         <Chip active={byEase} onClick={() => setByEase(!byEase)}>
           {byEase ? 'easiest first' : 'A–Z'}
         </Chip>
       </div>
-      <p className="mb-3 text-[0.7rem] leading-snug text-mute">{MODES.find(m => m.id === mode)?.hint}</p>
+      <p className="mb-3 text-[0.7rem] leading-snug text-mute">
+        {MODES.find(m => m.id === activeMode)?.hint}
+        {(!ready.att || !ready.def) && (
+          <>
+            {' '}
+            <span className="text-warn">
+              {!ready.att && !ready.def ? 'ATT and DEF unlock' : `${!ready.att ? 'ATT' : 'DEF'} unlocks`} once FPL
+              publishes team attack/defence ratings — they’re all zero until the season starts.
+            </span>
+          </>
+        )}
+      </p>
 
       <div className="card overflow-hidden rise">
         <div className="grid" style={{ gridTemplateColumns: `52px repeat(${view.events.length}, 1fr)` }}>

@@ -59,13 +59,18 @@ export const FlagChip = ({ flag }) =>
     </span>
   ) : null
 
-export const Chip = ({ active, onClick, children }) => (
+export const Chip = ({ active, onClick, disabled, title, children }) => (
   <button
     onClick={onClick}
+    disabled={disabled}
+    title={title}
+    aria-pressed={!!active}
     className={`shrink-0 rounded-full border px-3 py-1 text-[0.72rem] font-medium transition-colors ${
-      active
-        ? 'border-brand/50 bg-brand/10 text-brand'
-        : 'border-line bg-panel text-dim active:bg-panel2'
+      disabled
+        ? 'cursor-not-allowed border-line bg-panel2 text-mute/60'
+        : active
+          ? 'border-brand/50 bg-brand/10 text-brand'
+          : 'border-line bg-panel text-dim active:bg-panel2'
     }`}
   >
     {children}

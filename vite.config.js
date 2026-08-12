@@ -47,6 +47,7 @@ export default defineConfig({
     }),
   ],
   server: {
+    port: Number(process.env.PORT) || 5173,
     proxy: {
       // Dev-only CORS bypass; production uses VITE_FPL_PROXY (Cloudflare Worker)
       '/fpl-api': {

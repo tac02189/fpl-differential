@@ -61,19 +61,51 @@ export function captainScore(p, fix) {
   return s * chanceFactor(p)
 }
 
+// Each mode bands on the OPPOSITE side of the opponent: for my attackers the
+// opponent's defence is what matters, and vice versa.
+const MODE_KEYS = {
+  att: ['strength_defence_home', 'strength_defence_away'],
+  def: ['strength_attack_home', 'strength_attack_away'],
+}
+
+const modeValues = (teams, mode) => {
+  const [keyH, keyA] = MODE_KEYS[mode] || []
+  if (!keyH) return []
+  const out = []
+  for (const t of teams.values()) out.push(t[keyH], t[keyA])
+  return out
+}
+
+// FPL zeroes the granular attack/defence ratings until the season is underway
+// (pre-season every team reads 0). Checked per mode, not pooled across all four
+// fields — a populated attack pair must not vouch for a flat defence pair, or the
+// mode reading it renders one uniform colour with no warning.
+export function hasStrengthSplits(teams, mode) {
+  const vals = modeValues(teams, mode)
+  if (!vals.length || vals.some(v => !Number.isFinite(v) || v <= 0)) return false
+  return new Set(vals).size > 1
+}
+
 // Attack/defense-specific difficulty bands for the Fixtures grid.
 // Band an opponent's venue-specific strength into 1..5 across the league.
+// Returns null when this mode's underlying ratings aren't usable yet.
 export function strengthBander(teams, mode) {
-  const keyH = mode === 'att' ? 'strength_defence_home' : 'strength_attack_home'
-  const keyA = mode === 'att' ? 'strength_defence_away' : 'strength_attack_away'
-  const all = []
-  for (const t of teams.values()) all.push(t[keyH], t[keyA])
-  all.sort((a, b) => a - b)
+  if (!hasStrengthSplits(teams, mode)) return null
+  const [keyH, keyA] = MODE_KEYS[mode]
+  const all = modeValues(teams, mode).sort((a, b) => a - b)
+  // midrank percentile — FPL strengths cluster on round numbers, and counting
+  // only strictly-lower values would push every tied group into the easy end.
+  // Precomputed per distinct value so the grid doesn't rescan per cell.
+  const bands = new Map()
+  for (const v of new Set(all)) {
+    const below = all.filter(x => x < v).length
+    const equal = all.filter(x => x === v).length
+    bands.set(v, 1 + Math.min(4, Math.floor(((below + equal / 2) / all.length) * 5)))
+  }
   return (oppId, oppAtHome) => {
     const opp = teams.get(oppId)
-    const v = oppAtHome ? opp[keyH] : opp[keyA]
-    const below = all.filter(x => x < v).length
-    return 1 + Math.min(4, Math.floor((below / all.length) * 5))
+    if (!opp) return 3
+    return bands.get(oppAtHome ? opp[keyH] : opp[keyA]) ?? 3
   }
 }
 
