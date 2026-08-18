@@ -21,9 +21,13 @@ const {
   TEST_PUSH,
 } = process.env
 
-if (!WORKER_URL || !SUBS_SECRET || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
-  console.log('Missing configuration (WORKER_URL / SUBS_SECRET / VAPID keys) — nothing to do yet.')
-  process.exit(0)
+// Fail loudly: a green run that silently sent nothing is how a deadline gets missed.
+const missing = Object.entries({ WORKER_URL, SUBS_SECRET, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY })
+  .filter(([, v]) => !v)
+  .map(([k]) => k)
+if (missing.length) {
+  console.error(`Missing configuration: ${missing.join(', ')}. No notifications can be sent.`)
+  process.exit(1)
 }
 
 const AUTH = { Authorization: `Bearer ${SUBS_SECRET}` }
@@ -69,7 +73,9 @@ const state = await getJson(`${WORKER_URL}/state`, { headers: AUTH }).catch(e =>
   die(`GET /state failed (${e.message}) — aborting; next run retries.`),
 )
 state.sent ||= {}
-state.status ||= {}
+// seen[subscriberKey][playerId] = "status|news" last DELIVERED to that subscriber.
+// Per-subscriber, so one broken endpoint can't force re-alerts on everyone else.
+state.seen ||= {}
 
 const bs = await fpl('bootstrap-static/').catch(e => die(`FPL bootstrap failed (${e.message}) — aborting.`))
 const players = new Map(bs.elements.map(e => [e.id, e]))
@@ -84,6 +90,54 @@ for (const key of Object.keys(state.sent)) {
 }
 
 const subKeyOf = sub => hash(sub.subscription.endpoint)
+
+// Carry the old single global baseline over to each subscriber once, so the
+// switch to per-subscriber tracking doesn't blind us to changes across the gap.
+if (state.status) {
+  for (const sub of subs) {
+    const k = subKeyOf(sub)
+    if (!state.seen[k] && Object.keys(state.status).length) state.seen[k] = { ...state.status }
+  }
+  delete state.status
+}
+
+const statusLabel = p =>
+  p.status === 'a'
+    ? 'Available again'
+    : p.news || { d: 'Doubtful', i: 'Injured', s: 'Suspended', u: 'Unavailable' }[p.status] || 'Status change'
+
+// Pure so it can be exercised directly by scripts/test-notify-plan.mjs.
+// Returns one entry per (subscriber, changed player). Advancing a subscriber's
+// baseline is the CALLER's job, and only once that push actually delivers —
+// an undelivered alert stays pending for that subscriber alone.
+export function planInjuryAlerts({ subs, players, ownedBy, keyOf, seen }) {
+  const out = []
+  for (const sub of subs) {
+    const k = keyOf(sub)
+    const owned = ownedBy.get(k)
+    if (!owned) continue // squad unknown this run — never treat as "owns nothing"
+    const mine = (seen[k] ||= {})
+    for (const id of owned) {
+      const p = players.get(id)
+      if (!p) continue
+      const now = `${p.status}|${p.news || ''}`
+      if (mine[id] === now) continue
+      // first sight, or a news-text shuffle while still available — record silently
+      if (mine[id] === undefined || (p.status === 'a' && mine[id].startsWith('a'))) {
+        mine[id] = now
+        continue
+      }
+      out.push({ sub, subKey: k, playerId: id, statusKey: now, player: p, label: statusLabel(p) })
+    }
+  }
+  return out
+}
+
+const hoursLeft = hrs => {
+  const h = Math.floor(hrs)
+  const m = Math.round((hrs - h) * 60)
+  return h > 0 ? `${h}h ${String(m).padStart(2, '0')}m` : `${m} minutes`
+}
 const queue = [] // { sub, payload, onDelivered? }
 
 if (TEST_PUSH === 'true' || TEST_PUSH === '1') {
@@ -116,7 +170,10 @@ if (next) {
   const dlKey = `${next.id}|${next.deadline_time}`
   const hrs = (new Date(next.deadline_time) - Date.now()) / 3.6e6
   const sent = (state.sent[dlKey] ||= {})
-  const phase = hrs > 0 && hrs <= 2 ? 't2' : hrs > 2 && hrs <= 24 ? 't24' : null
+  // The final window is 3h wide (six scheduled runs) rather than 2h, so a couple of
+  // delayed or dropped GitHub cron ticks can't swallow the last reminder outright.
+  // The body states the real time left, so it stays accurate whenever it lands.
+  const phase = hrs > 0 && hrs <= 3 ? 't2' : hrs > 3 && hrs <= 24 ? 't24' : null
   if (phase) {
     const delivered = new Set(sent[phase] || [])
     for (const sub of subs) {
@@ -128,13 +185,18 @@ if (next) {
       queue.push({
         sub,
         payload: {
-          title: phase === 't2' ? `GW${next.id} deadline in ~2 hours` : `GW${next.id} deadline approaching`,
+          title:
+            phase === 't2'
+              ? `GW${next.id} deadline in ${hoursLeft(hrs)}`
+              : `GW${next.id} deadline approaching`,
           body: `${CT(next.deadline_time)} Central.${flagTxt}`,
           tag: `deadline-${next.id}-${phase}`,
         },
         onDelivered: () => {
           delivered.add(k)
           sent[phase] = [...delivered]
+          // a late T-24 after the final reminder would only confuse
+          if (phase === 't2') sent.t24 = [...new Set([...(sent.t24 || []), k])]
         },
       })
     }
@@ -143,58 +205,40 @@ if (next) {
 
 // --- injury / status changes on owned players ---
 if (current) {
-  let allPicksOk = true
+  // absent key = squad unreadable this run (never the same as "owns nothing"),
+  // which both the planner and the pruner below treat as "leave this one alone"
   const ownedBy = new Map() // subscriber key → Set(elementIds)
   for (const sub of subs) {
     const owned = await ownedPlayers(sub.teamId)
-    if (owned === null) {
-      allPicksOk = false
-      continue
-    }
-    ownedBy.set(subKeyOf(sub), new Set(owned))
+    if (owned !== null) ownedBy.set(subKeyOf(sub), new Set(owned))
   }
-  const ownedUnion = new Set()
-  for (const s of ownedBy.values()) for (const id of s) ownedUnion.add(id)
-
-  for (const id of ownedUnion) {
-    const p = players.get(id)
-    if (!p) continue
-    const prev = state.status[id]
-    const now = `${p.status}|${p.news || ''}`
-    if (prev === now) continue
-    const notifiable = prev !== undefined && !(p.status === 'a' && prev.startsWith('a'))
-    if (!notifiable) {
-      // first sight, or a benign news-text shuffle while available — just advance
-      state.status[id] = now
-      continue
-    }
-    const label =
-      p.status === 'a'
-        ? 'Available again'
-        : p.news || { d: 'Doubtful', i: 'Injured', s: 'Suspended', u: 'Unavailable' }[p.status] || 'Status change'
-    const targets = subs.filter(sub => ownedBy.get(subKeyOf(sub))?.has(p.id))
-    if (targets.length === 0) {
-      state.status[id] = now
-      continue
-    }
-    // baseline advances only once every owner's alert has delivered
-    let remaining = targets.length
-    for (const sub of targets) {
-      queue.push({
-        sub,
-        // tag is unique per transition so an escalation re-alerts instead of silently
-        // replacing the earlier notification
-        payload: { title: `${p.web_name} — squad alert`, body: label, tag: `news-${p.id}-${hash(now).slice(0, 6)}` },
-        onDelivered: () => {
-          if (--remaining === 0) state.status[id] = now
-        },
-      })
-    }
+  for (const plan of planInjuryAlerts({ subs, players, ownedBy, keyOf: subKeyOf, seen: state.seen })) {
+    queue.push({
+      sub: plan.sub,
+      // tag is unique per transition so an escalation re-alerts instead of silently
+      // replacing the earlier notification
+      payload: {
+        title: `${plan.player.web_name} — squad alert`,
+        body: plan.label,
+        tag: `news-${plan.playerId}-${hash(plan.statusKey).slice(0, 6)}`,
+      },
+      onDelivered: () => {
+        ;(state.seen[plan.subKey] ||= {})[plan.playerId] = plan.statusKey
+      },
+    })
   }
 
-  // prune baselines only when current ownership is known for every subscriber
-  if (allPicksOk) {
-    for (const id of Object.keys(state.status)) if (!ownedUnion.has(Number(id))) delete state.status[id]
+  // Prune per-subscriber baselines: drop players a subscriber no longer owns (only
+  // when that squad was actually readable), and drop subscribers that have gone away.
+  const liveKeys = new Set(subs.map(subKeyOf))
+  for (const k of Object.keys(state.seen)) {
+    if (!liveKeys.has(k)) {
+      delete state.seen[k]
+      continue
+    }
+    const owned = ownedBy.get(k)
+    if (!owned) continue
+    for (const id of Object.keys(state.seen[k])) if (!owned.has(Number(id))) delete state.seen[k][id]
   }
 }
 
