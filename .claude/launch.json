@@ -3,8 +3,11 @@
   "configurations": [
     {
       "name": "fpl-differential",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeExecutable": "C:\\Program Files\\nodejs\\node.exe",
+      "runtimeArgs": [
+        ".claude/npm-run.cjs",
+        "dev"
+      ],
       "port": 5173,
       "autoPort": true
     }
