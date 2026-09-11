@@ -1,13 +1,13 @@
 import { useMemo, useState } from 'react'
 import { ctxFrom, getBootstrap, getFixtures } from '../api/fpl'
 import { useAsync } from '../lib/useAsync'
-import { fixtureRun, hasStrengthSplits, strengthBander } from '../lib/metrics'
+import { MIN_RATED_MATCHES, computeTeamRatings, fixtureRun, ratedMatches, ratingBander } from '../lib/metrics'
 import { Chip, ErrorNote, Spinner } from '../components/Bits'
 
 const MODES = [
   { id: 'fdr', label: 'FDR', hint: 'Overall fixture difficulty (official FPL ratings).' },
-  { id: 'att', label: 'ATT', hint: 'For your attackers — how soft each opponent’s defence is.' },
-  { id: 'def', label: 'DEF', hint: 'For your defence — how blunt each opponent’s attack is.' },
+  { id: 'att', label: 'ATT', hint: 'For your attackers — how leaky each opponent’s defence is, by xG conceded.' },
+  { id: 'def', label: 'DEF', hint: 'For your defence — how dangerous each opponent’s attack is, by xG scored.' },
 ]
 
 export default function Fixtures() {
@@ -18,15 +18,16 @@ export default function Fixtures() {
 
   const ctx = useMemo(() => (boot.data ? ctxFrom(boot.data) : null), [boot.data])
 
-  // FPL publishes attack/defence ratings only once the season is underway, and
-  // may publish one side before the other — so check each mode independently
+  // ATT/DEF run on ratings derived from played matches (FPL's own attack/defence
+  // strength fields are permanently zero), so they need a few gameweeks first
+  const ratings = useMemo(
+    () => (ctx && fx.data ? computeTeamRatings(ctx.bs, fx.data) : null),
+    [ctx, fx.data],
+  )
+  const played = ratings ? ratedMatches(ratings) : 0
   const ready = useMemo(
-    () => ({
-      fdr: true,
-      att: ctx ? hasStrengthSplits(ctx.teams, 'att') : false,
-      def: ctx ? hasStrengthSplits(ctx.teams, 'def') : false,
-    }),
-    [ctx],
+    () => ({ fdr: true, att: !!ratingBander(ratings, 'att'), def: !!ratingBander(ratings, 'def') }),
+    [ratings],
   )
   const activeMode = ready[mode] ? mode : 'fdr'
 
@@ -36,7 +37,7 @@ export default function Fixtures() {
     const events = []
     for (let e = start; e <= Math.min(38, start + 5); e++) events.push(e)
     const last = events[events.length - 1]
-    const bander = activeMode === 'fdr' ? null : strengthBander(ctx.teams, activeMode)
+    const bander = activeMode === 'fdr' ? null : ratingBander(ratings, activeMode)
     const rows = [...ctx.teams.values()].map(t => {
       const run = fixtureRun(fx.data, t.id, start, 99).filter(f => f.event <= last)
       const cells = events.map(e =>
@@ -49,7 +50,7 @@ export default function Fixtures() {
     })
     rows.sort(byEase ? (a, b) => b.easeSum - a.easeSum : (a, b) => a.t.short_name.localeCompare(b.t.short_name))
     return { events, rows }
-  }, [ctx, fx.data, activeMode, byEase])
+  }, [ctx, fx.data, ratings, activeMode, byEase])
 
   if (boot.loading || fx.loading) return <Spinner label="Charting the run-ins" />
   if (boot.error || fx.error || !view) return <ErrorNote />
@@ -65,7 +66,7 @@ export default function Fixtures() {
               active={activeMode === m.id}
               disabled={locked}
               onClick={() => setMode(m.id)}
-              title={locked ? 'FPL publishes attack/defence ratings once the season starts' : undefined}
+              title={locked ? `Needs ${MIN_RATED_MATCHES} played matches per team` : undefined}
             >
               {m.label}
             </Chip>
@@ -78,12 +79,12 @@ export default function Fixtures() {
       </div>
       <p className="mb-3 text-[0.7rem] leading-snug text-mute">
         {MODES.find(m => m.id === activeMode)?.hint}
+        {activeMode !== 'fdr' && <> Built from {played} played {played === 1 ? 'match' : 'matches'}.</>}
         {(!ready.att || !ready.def) && (
           <>
             {' '}
             <span className="text-warn">
-              {!ready.att && !ready.def ? 'ATT and DEF unlock' : `${!ready.att ? 'ATT' : 'DEF'} unlocks`} once FPL
-              publishes team attack/defence ratings — they’re all zero until the season starts.
+              ATT and DEF need {MIN_RATED_MATCHES} played matches per team to rank on — {played} so far.
             </span>
           </>
         )}

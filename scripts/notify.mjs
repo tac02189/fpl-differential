@@ -1,5 +1,6 @@
-// Notification cron — runs on GitHub Actions every 30 min (see .github/workflows/notify.yml).
-// Sends Web Push: deadline reminders (T-24h / T-2h) and injury/status alerts for owned players.
+// Notification cron — scheduled every 30 min on GitHub Actions (see notify.yml), though
+// GitHub actually fires ~15% of those ticks; the reminder windows are sized for that.
+// Sends Web Push: deadline reminders (day-before / final) and injury alerts for owned players.
 // Subscriptions + dedup state live in the Cloudflare Worker's KV (same worker as the CORS proxy).
 //
 // Reliability rules (adversarially reviewed before go-live):
@@ -42,6 +43,21 @@ async function getJson(url, opts) {
   return r.json()
 }
 
+// The reads below are all-or-nothing — a failure aborts the run — so absorb the
+// occasional blip rather than failing the whole run (and emailing) over one.
+async function getJsonRetry(url, opts, tries = 3) {
+  let last
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await getJson(url, opts)
+    } catch (e) {
+      last = e
+      if (i < tries - 1) await new Promise(r => setTimeout(r, 1500 * (i + 1)))
+    }
+  }
+  throw last
+}
+
 const fpl = p =>
   getJson(`https://fantasy.premierleague.com/api/${p}`, {
     headers: { 'User-Agent': 'fpl-differential notify bot' },
@@ -61,7 +77,7 @@ webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY)
 
 // Abort (never "treat as empty") when subs or state can't be read — running with
 // amnesia duplicates reminders and erases injury baselines.
-const rawSubs = await getJson(`${WORKER_URL}/subs`, { headers: AUTH }).catch(e =>
+const rawSubs = await getJsonRetry(`${WORKER_URL}/subs`, { headers: AUTH }).catch(e =>
   die(`GET /subs failed (${e.message}) — aborting; next run retries.`),
 )
 const subs = (Array.isArray(rawSubs) ? rawSubs : []).filter(s => s?.subscription?.endpoint)
@@ -69,7 +85,7 @@ if (subs.length === 0) {
   console.log('No subscribers.')
   process.exit(0)
 }
-const state = await getJson(`${WORKER_URL}/state`, { headers: AUTH }).catch(e =>
+const state = await getJsonRetry(`${WORKER_URL}/state`, { headers: AUTH }).catch(e =>
   die(`GET /state failed (${e.message}) — aborting; next run retries.`),
 )
 state.sent ||= {}
@@ -170,10 +186,11 @@ if (next) {
   const dlKey = `${next.id}|${next.deadline_time}`
   const hrs = (new Date(next.deadline_time) - Date.now()) / 3.6e6
   const sent = (state.sent[dlKey] ||= {})
-  // The final window is 3h wide (six scheduled runs) rather than 2h, so a couple of
-  // delayed or dropped GitHub cron ticks can't swallow the last reminder outright.
-  // The body states the real time left, so it stays accurate whenever it lands.
-  const phase = hrs > 0 && hrs <= 3 ? 't2' : hrs > 3 && hrs <= 24 ? 't24' : null
+  // Measured 2026-09-11: GitHub fires only ~15% of the */30 ticks (median gap 3.1h,
+  // p90 5h, max 6.5h). Against that real timeline a 3h final window lands a run just
+  // 78% of the time — one gameweek in five with no last reminder. 6h gets it to 99.7%.
+  // The body carries the true time left, so it reads correctly whenever it fires.
+  const phase = hrs > 0 && hrs <= 6 ? 't2' : hrs > 6 && hrs <= 24 ? 't24' : null
   if (phase) {
     const delivered = new Set(sent[phase] || [])
     for (const sub of subs) {

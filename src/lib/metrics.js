@@ -61,51 +61,85 @@ export function captainScore(p, fix) {
   return s * chanceFactor(p)
 }
 
-// Each mode bands on the OPPOSITE side of the opponent: for my attackers the
-// opponent's defence is what matters, and vice versa.
-const MODE_KEYS = {
-  att: ['strength_defence_home', 'strength_defence_away'],
-  def: ['strength_attack_home', 'strength_attack_away'],
-}
-
-const modeValues = (teams, mode) => {
-  const [keyH, keyA] = MODE_KEYS[mode] || []
-  if (!keyH) return []
-  const out = []
-  for (const t of teams.values()) out.push(t[keyH], t[keyA])
-  return out
-}
-
-// FPL zeroes the granular attack/defence ratings until the season is underway
-// (pre-season every team reads 0). Checked per mode, not pooled across all four
-// fields — a populated attack pair must not vouch for a flat defence pair, or the
-// mode reading it renders one uniform colour with no warning.
-export function hasStrengthSplits(teams, mode) {
-  const vals = modeValues(teams, mode)
-  if (!vals.length || vals.some(v => !Number.isFinite(v) || v <= 0)) return false
-  return new Set(vals).size > 1
-}
-
-// Attack/defense-specific difficulty bands for the Fixtures grid.
-// Band an opponent's venue-specific strength into 1..5 across the league.
-// Returns null when this mode's underlying ratings aren't usable yet.
-export function strengthBander(teams, mode) {
-  if (!hasStrengthSplits(teams, mode)) return null
-  const [keyH, keyA] = MODE_KEYS[mode]
-  const all = modeValues(teams, mode).sort((a, b) => a - b)
-  // midrank percentile — FPL strengths cluster on round numbers, and counting
-  // only strictly-lower values would push every tied group into the easy end.
-  // Precomputed per distinct value so the grid doesn't rescan per cell.
+// Band values into 1..5 by midrank percentile — midrank rather than a strict
+// less-than count so tied groups sit at their true centre instead of being
+// pushed to the easy end. Higher value in = harder band out.
+function bandByPercentile(values) {
+  const all = [...values].sort((a, b) => a - b)
   const bands = new Map()
   for (const v of new Set(all)) {
     const below = all.filter(x => x < v).length
     const equal = all.filter(x => x === v).length
     bands.set(v, 1 + Math.min(4, Math.floor(((below + equal / 2) / all.length) * 5)))
   }
+  return bands
+}
+
+export const MIN_RATED_MATCHES = 3
+
+// FPL's granular ratings (strength_attack_*/strength_defence_*) are dead fields:
+// they read 0 for every team pre-season AND three gameweeks in, with
+// team.strength null throughout. Attack/defence difficulty is therefore derived
+// from actual played football — team xG scored per match, and xG conceded per 90.
+export function computeTeamRatings(bs, fixtures) {
+  const out = new Map()
+  for (const t of bs.teams) out.set(t.id, { mp: 0, xg: 0, xgPerMatch: 0, xgcPer90: 0 })
+
+  for (const f of fixtures || []) {
+    if (!f.finished) continue
+    const h = out.get(f.team_h)
+    const a = out.get(f.team_a)
+    if (h) h.mp++
+    if (a) a.mp++
+  }
+
+  // xG scored sums cleanly across a squad; xG conceded accrues per player while
+  // they are on the pitch, so the minutes leader carries the closest thing to
+  // the team's own figure.
+  const anchor = new Map()
+  for (const p of bs.elements) {
+    const t = out.get(p.team)
+    if (!t) continue
+    t.xg += num(p.expected_goals)
+    const best = anchor.get(p.team)
+    if (!best || p.minutes > best.minutes) anchor.set(p.team, p)
+  }
+  for (const [teamId, p] of anchor) {
+    if (p.minutes > 0) out.get(teamId).xgcPer90 = num(p.expected_goals_conceded) / (p.minutes / 90)
+  }
+  for (const t of out.values()) t.xgPerMatch = t.mp > 0 ? t.xg / t.mp : 0
+  return out
+}
+
+export const ratedMatches = ratings =>
+  ratings && ratings.size ? Math.min(...[...ratings.values()].map(r => r.mp)) : 0
+
+// Sides score more and concede less at home. A flat ~10% edge is the long-run
+// Premier League figure; FPL's strength_overall_home/away can't supply it —
+// most clubs are rated HIGHER away there, so it isn't team strength by venue.
+const HOME_EDGE = 1.1
+
+// ATT asks how good a fixture is for MY attackers, so it rates the opponent's
+// DEFENCE; DEF rates the opponent's ATTACK. Null until enough football is played.
+export function ratingBander(ratings, mode) {
+  if (!ratings || !ratings.size || !['att', 'def'].includes(mode)) return null
+  if (ratedMatches(ratings) < MIN_RATED_MATCHES) return null
+
+  // difficulty value: higher = tougher fixture for my players
+  const valueFor = (r, oppAtHome) =>
+    mode === 'att'
+      ? -(r.xgcPer90 * (oppAtHome ? 1 / HOME_EDGE : HOME_EDGE)) // tighter at home; leaky defence = easy = low value
+      : r.xgPerMatch * (oppAtHome ? HOME_EDGE : 1 / HOME_EDGE) // more potent at home = harder = high value
+
+  const values = []
+  for (const r of ratings.values()) values.push(valueFor(r, true), valueFor(r, false))
+  if (new Set(values).size < 2) return null
+  const bands = bandByPercentile(values)
+
   return (oppId, oppAtHome) => {
-    const opp = teams.get(oppId)
-    if (!opp) return 3
-    return bands.get(oppAtHome ? opp[keyH] : opp[keyA]) ?? 3
+    const r = ratings.get(oppId)
+    if (!r) return 3
+    return bands.get(valueFor(r, oppAtHome)) ?? 3
   }
 }
 
