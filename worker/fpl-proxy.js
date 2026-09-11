@@ -51,13 +51,15 @@ export default {
       const body = await req.json().catch(() => null)
       if (!validPushEndpoint(body?.subscription?.endpoint)) return json({ error: 'bad subscription' }, 400)
       const key = await subKey(body.subscription.endpoint)
+      const teamId = body.teamId || null
+      const device = typeof body.device === 'string' ? body.device.slice(0, 32) : null
       const existing = await env.SUBS.get(key)
-      const core = JSON.stringify({ subscription: body.subscription, teamId: body.teamId || null })
+      const core = JSON.stringify({ subscription: body.subscription, teamId, device })
       if (existing) {
         // identical re-registration: skip the KV write (KV writes are the scarce quota)
         try {
           const prev = JSON.parse(existing)
-          if (JSON.stringify({ subscription: prev.subscription, teamId: prev.teamId }) === core) {
+          if (JSON.stringify({ subscription: prev.subscription, teamId: prev.teamId, device: prev.device ?? null }) === core) {
             return json({ ok: true })
           }
         } catch {
@@ -68,8 +70,34 @@ export default {
         const list = await env.SUBS.list({ prefix: 'sub:', limit: 25 })
         if (list.keys.length >= 20) return json({ error: 'subscription limit reached' }, 429)
       }
-      await env.SUBS.put(key, JSON.stringify({ subscription: body.subscription, teamId: body.teamId || null, t: Date.now() }))
-      return json({ ok: true })
+
+      // Reinstalling a PWA mints a brand-new push endpoint while the old one keeps
+      // accepting pushes for weeks, so the same phone ends up notified twice. Retire
+      // prior registrations for this team on this device kind; a genuinely different
+      // device reports a different kind and survives. Entries stored before `device`
+      // existed carry none, so they match and get upgraded rather than lingering.
+      const stale = []
+      if (teamId) {
+        const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
+        for (const k of list.keys) {
+          if (k.name === key) continue
+          const raw = await env.SUBS.get(k.name)
+          if (!raw) continue
+          let prev
+          try {
+            prev = JSON.parse(raw)
+          } catch {
+            continue
+          }
+          if (prev.teamId !== teamId) continue
+          if (device && prev.device && prev.device !== device) continue
+          stale.push(k.name)
+        }
+        for (const name of stale) await env.SUBS.delete(name)
+      }
+
+      await env.SUBS.put(key, JSON.stringify({ subscription: body.subscription, teamId, device, t: Date.now() }))
+      return json({ ok: true, replaced: stale.length })
     }
 
     if (url.pathname === '/unsubscribe' && req.method === 'POST') {

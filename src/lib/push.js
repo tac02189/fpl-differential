@@ -6,6 +6,17 @@ const b64ToU8 = s => {
   return Uint8Array.from(raw, c => c.charCodeAt(0))
 }
 
+// Coarse device kind (no identifying detail) so the worker can tell "this phone
+// reinstalled the app" from "a second device signed up" and retire only the former.
+const deviceKind = () => {
+  const ua = navigator.userAgent || ''
+  if (/iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return 'ios'
+  if (/Android/.test(ua)) return 'android'
+  if (/Macintosh/.test(ua)) return 'mac'
+  if (/Windows/.test(ua)) return 'windows'
+  return 'other'
+}
+
 export const pushSupported = () =>
   !!WORKER_URL && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window
 
@@ -30,7 +41,7 @@ export async function enablePush(teamId) {
     res = await fetch(`${WORKER_URL}/subscribe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subscription: sub.toJSON(), teamId: teamId || null }),
+      body: JSON.stringify({ subscription: sub.toJSON(), teamId: teamId || null, device: deviceKind() }),
     })
   } catch {
     res = null
