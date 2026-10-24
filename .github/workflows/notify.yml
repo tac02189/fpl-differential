@@ -24,7 +24,32 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install --no-save --no-audit --no-fund web-push
+      # A registry ECONNRESET failed the 2026-10-23 20:00Z run here, emailing a red
+      # build for a tick that had nothing to send. notify.mjs already retries its /subs
+      # and /state reads for that reason (getJsonRetry); this retries the whole install,
+      # which covers more ground than npm's own per-request retries — those are not
+      # guaranteed to cover a reset that arrives mid-tarball.
+      # Actions runs this block as `bash -e`, so the install goes in an `if` condition:
+      # a bare failing command would abort the step and the loop would never retry.
+      # A recovered attempt still leaves a warning annotation, so a degrading registry
+      # stays visible instead of hiding behind a green run.
+      - name: Install web-push (retry transient registry failures)
+        timeout-minutes: 5
+        run: |
+          for i in 1 2 3; do
+            if npm install --no-save --no-audit --no-fund web-push; then
+              if [ "$i" -gt 1 ]; then
+                echo "::warning::npm install recovered on attempt $i/3"
+              fi
+              exit 0
+            fi
+            if [ "$i" -lt 3 ]; then
+              echo "npm install failed (attempt $i/3) — retrying in $((i * 10))s"
+              sleep $((i * 10))
+            fi
+          done
+          echo "npm install failed after 3 attempts; see the errors above."
+          exit 1
       - run: node scripts/notify.mjs
         env:
           WORKER_URL: ${{ vars.WORKER_URL }}
