@@ -11,6 +11,7 @@
 // - The final state PUT is verified and retried; on failure the run exits nonzero so the
 //   red Actions run is visible (bias: a rare duplicate beats a silent miss).
 import { createHash } from 'node:crypto'
+import { writeSync } from 'node:fs'
 import webpush from 'web-push'
 
 const {
@@ -27,13 +28,15 @@ const missing = Object.entries({ WORKER_URL, SUBS_SECRET, VAPID_PUBLIC_KEY, VAPI
   .filter(([, v]) => !v)
   .map(([k]) => k)
 if (missing.length) {
-  console.error(`Missing configuration: ${missing.join(', ')}. No notifications can be sent.`)
+  writeSync(2, `Missing configuration: ${missing.join(', ')}. No notifications can be sent.\n`)
   process.exit(1)
 }
 
 const AUTH = { Authorization: `Bearer ${SUBS_SECRET}` }
 const die = msg => {
-  console.error(msg)
+  // writeSync, not console.error: process.exit() can discard a buffered write to a
+  // pipe, and this line is the only record of why the run aborted.
+  writeSync(2, `${msg}\n`)
   process.exit(1)
 }
 
@@ -90,7 +93,7 @@ if (!Array.isArray(rawSubs)) {
 // in hash(), taking down the run for everyone — so require an actual string.
 const subs = rawSubs.filter(s => typeof s?.subscription?.endpoint === 'string' && s.subscription.endpoint.length > 0)
 if (rawSubs.length === 0) {
-  console.log('No subscribers.')
+  writeSync(1, 'No subscribers.\n')
   process.exit(0)
 }
 // Stored records that are ALL unusable is a data fault, not an empty list. Exiting 0
@@ -335,4 +338,5 @@ try {
 
 const malformedTxt = droppedSubs > 0 ? `, ${droppedSubs} malformed` : ''
 console.log(`Done — ${okCount} push(es) delivered, ${deferred} deferred, ${subs.length} subscriber(s)${malformedTxt}.`)
-if (deferred > 0) process.exit(1)
+// exitCode, not exit(): let the summary above flush, the way the success path already does.
+if (deferred > 0) process.exitCode = 1
