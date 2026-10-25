@@ -80,10 +80,33 @@ webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY)
 const rawSubs = await getJsonRetry(`${WORKER_URL}/subs`, { headers: AUTH }).catch(e =>
   die(`GET /subs failed (${e.message}) — aborting; next run retries.`),
 )
-const subs = (Array.isArray(rawSubs) ? rawSubs : []).filter(s => s?.subscription?.endpoint)
-if (subs.length === 0) {
+// GET /subs answers with an array on every success, and "none stored" is []. Anything
+// else at 200 means this is not the worker we think it is (misroute, proxy, worker bug);
+// reading it as "no subscribers" is exactly the silent green run line 25 warns about.
+if (!Array.isArray(rawSubs)) {
+  die(`GET /subs returned ${rawSubs === null ? 'null' : typeof rawSubs}, not an array — aborting; next run retries.`)
+}
+// A truthy non-string endpoint would survive a bare truthiness check and then throw
+// in hash(), taking down the run for everyone — so require an actual string.
+const subs = rawSubs.filter(s => typeof s?.subscription?.endpoint === 'string' && s.subscription.endpoint.length > 0)
+if (rawSubs.length === 0) {
   console.log('No subscribers.')
   process.exit(0)
+}
+// Stored records that are ALL unusable is a data fault, not an empty list. Exiting 0
+// here would report success for a run that reached nobody.
+if (subs.length === 0) {
+  die(`All ${rawSubs.length} stored subscription(s) lack a usable endpoint — aborting; next run retries.`)
+}
+// Some usable: notify those rather than abort the run, but say so. Deliberately not
+// fatal — a permanently red cron over one stale record is how red runs stop being read.
+const droppedSubs = rawSubs.length - subs.length
+if (droppedSubs > 0) {
+  const msg = `Ignoring ${droppedSubs} stored subscription(s) with no usable endpoint.`
+  console.error(msg)
+  // Surface it in the Actions run summary too: a stderr line in a green run is easy to
+  // never read, and this one means someone is silently receiving no notifications.
+  if (process.env.GITHUB_ACTIONS === 'true') console.log(`::warning::${msg}`)
 }
 const state = await getJsonRetry(`${WORKER_URL}/state`, { headers: AUTH }).catch(e =>
   die(`GET /state failed (${e.message}) — aborting; next run retries.`),
@@ -310,5 +333,6 @@ try {
   }
 }
 
-console.log(`Done — ${okCount} push(es) delivered, ${deferred} deferred, ${subs.length} subscriber(s).`)
+const malformedTxt = droppedSubs > 0 ? `, ${droppedSubs} malformed` : ''
+console.log(`Done — ${okCount} push(es) delivered, ${deferred} deferred, ${subs.length} subscriber(s)${malformedTxt}.`)
 if (deferred > 0) process.exit(1)
