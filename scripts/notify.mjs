@@ -91,7 +91,8 @@ if (!Array.isArray(rawSubs)) {
 }
 // A truthy non-string endpoint would survive a bare truthiness check and then throw
 // in hash(), taking down the run for everyone — so require an actual string.
-const subs = rawSubs.filter(s => typeof s?.subscription?.endpoint === 'string' && s.subscription.endpoint.length > 0)
+const usableSub = s => typeof s?.subscription?.endpoint === 'string' && s.subscription.endpoint.length > 0
+const subs = rawSubs.filter(usableSub)
 if (rawSubs.length === 0) {
   writeSync(1, 'No subscribers.\n')
   process.exit(0)
@@ -273,9 +274,16 @@ if (current) {
 
   // Prune per-subscriber baselines: drop players a subscriber no longer owns (only
   // when that squad was actually readable), and drop subscribers that have gone away.
-  const liveKeys = new Set(subs.map(subKeyOf))
+  // Every subscriber the worker still holds a record for. A record we had to drop is
+  // still a subscriber that exists, and the worker returns its KV key so it can be told
+  // apart from one that genuinely unsubscribed. Without that key it would look departed,
+  // and pruning its baseline would make the next status change read as "first sight"
+  // and record silently. A worker predating the `key` field contributes none, which is
+  // exactly the old behaviour — so the two deploy in either order.
+  const knownKeys = new Set(subs.map(subKeyOf))
+  for (const s of rawSubs) if (!usableSub(s) && typeof s?.key === 'string' && s.key) knownKeys.add(s.key)
   for (const k of Object.keys(state.seen)) {
-    if (!liveKeys.has(k)) {
+    if (!knownKeys.has(k)) {
       delete state.seen[k]
       continue
     }

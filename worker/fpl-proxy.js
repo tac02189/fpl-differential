@@ -39,6 +39,21 @@ function validPushEndpoint(ep) {
   }
 }
 
+// An endpoint alone cannot be pushed to: web-push encrypts every payload with these
+// two keys, so a record missing them fails delivery on every run, forever, and never
+// self-heals. Browsers always supply both through PushSubscription.toJSON(). The
+// lengths are floors, not exact sizes (p256dh is 87 chars, auth 22), so a future
+// encoding change cannot lock subscribers out.
+function validPushKeys(k) {
+  return (
+    !!k &&
+    typeof k.p256dh === 'string' &&
+    k.p256dh.length >= 64 &&
+    typeof k.auth === 'string' &&
+    k.auth.length >= 16
+  )
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url)
@@ -50,6 +65,7 @@ export default {
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
       const body = await req.json().catch(() => null)
       if (!validPushEndpoint(body?.subscription?.endpoint)) return json({ error: 'bad subscription' }, 400)
+      if (!validPushKeys(body.subscription.keys)) return json({ error: 'bad subscription keys' }, 400)
       const key = await subKey(body.subscription.endpoint)
       const teamId = body.teamId || null
       const device = typeof body.device === 'string' ? body.device.slice(0, 32) : null
@@ -117,7 +133,20 @@ export default {
       const out = []
       for (const k of list.keys) {
         const v = await env.SUBS.get(k.name)
-        if (v) out.push(JSON.parse(v))
+        if (!v) continue
+        // The KV key is sub:<sha256(endpoint)> and the cron's subscriber id is its first
+        // 16 hex chars. Returning it lets the cron tell "a record I cannot use" apart
+        // from "a subscriber who unsubscribed": without it an unusable record looks
+        // departed, and pruning its injury baseline makes the next status change read
+        // as first sight and record silently.
+        const id = k.name.slice(4, 20)
+        try {
+          out.push({ ...JSON.parse(v), key: id })
+        } catch {
+          // Unparseable value — still a subscriber that exists. Report the id alone
+          // rather than throwing, which would 5xx the entire list.
+          out.push({ key: id })
+        }
       }
       return json(out)
     }
