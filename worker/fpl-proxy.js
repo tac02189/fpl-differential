@@ -44,14 +44,26 @@ function validPushEndpoint(ep) {
 // self-heals. Browsers always supply both through PushSubscription.toJSON(). The
 // lengths are floors, not exact sizes (p256dh is 87 chars, auth 22), so a future
 // encoding change cannot lock subscribers out.
+// Decoded byte length of a base64url string, or -1 if it is not base64url at all.
+function b64urlBytes(s) {
+  // Accept the standard alphabet as well as base64url: browsers emit base64url, but
+  // being strict here would lock out a client for an encoding choice, which is the one
+  // failure this validator must not cause.
+  if (typeof s !== 'string' || !/^[A-Za-z0-9+/_-]+=*$/.test(s)) return -1
+  const b = s.replace(/=+$/, '').replace(/-/g, '+').replace(/_/g, '/')
+  try {
+    return atob(b + '='.repeat((4 - (b.length % 4)) % 4)).length
+  } catch {
+    return -1
+  }
+}
+
 function validPushKeys(k) {
-  return (
-    !!k &&
-    typeof k.p256dh === 'string' &&
-    k.p256dh.length >= 64 &&
-    typeof k.auth === 'string' &&
-    k.auth.length >= 16
-  )
+  // Byte lengths, not character counts: web-push needs p256dh to decode to a 65-byte
+  // uncompressed P-256 point and auth to at least 16 bytes. A record that merely looks
+  // long enough still throws on every send, with no status code to mark it gone, so it
+  // can never be auto-retired — it just reddens the cron and holds one of the 20 slots.
+  return !!k && b64urlBytes(k.p256dh) === 65 && b64urlBytes(k.auth) >= 16
 }
 
 export default {

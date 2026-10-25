@@ -91,7 +91,29 @@ if (!Array.isArray(rawSubs)) {
 }
 // A truthy non-string endpoint would survive a bare truthiness check and then throw
 // in hash(), taking down the run for everyone — so require an actual string.
-const usableSub = s => typeof s?.subscription?.endpoint === 'string' && s.subscription.endpoint.length > 0
+// An endpoint is not enough to send to. web-push encrypts every payload with p256dh
+// (a 65-byte P-256 point) and auth (16+ bytes); given neither, it throws a plain Error
+// carrying no statusCode, which sendOne can only read as transient. So the push is
+// retried, deferred, and reddens every run that queues anything for that subscriber —
+// forever, because no 404/410 ever arrives to retire it. Dropping it here says so once.
+const b64urlBytes = s => {
+  try {
+    return Buffer.from(s, 'base64url').length
+  } catch {
+    return 0
+  }
+}
+const usableSub = s => {
+  const { endpoint, keys } = s?.subscription || {}
+  return (
+    typeof endpoint === 'string' &&
+    endpoint.length > 0 &&
+    typeof keys?.p256dh === 'string' &&
+    b64urlBytes(keys.p256dh) === 65 &&
+    typeof keys?.auth === 'string' &&
+    b64urlBytes(keys.auth) >= 16
+  )
+}
 const subs = rawSubs.filter(usableSub)
 if (rawSubs.length === 0) {
   writeSync(1, 'No subscribers.\n')
@@ -100,13 +122,13 @@ if (rawSubs.length === 0) {
 // Stored records that are ALL unusable is a data fault, not an empty list. Exiting 0
 // here would report success for a run that reached nobody.
 if (subs.length === 0) {
-  die(`All ${rawSubs.length} stored subscription(s) lack a usable endpoint — aborting; next run retries.`)
+  die(`All ${rawSubs.length} stored subscription(s) are unusable (endpoint or push keys) — aborting; next run retries.`)
 }
 // Some usable: notify those rather than abort the run, but say so. Deliberately not
 // fatal — a permanently red cron over one stale record is how red runs stop being read.
 const droppedSubs = rawSubs.length - subs.length
 if (droppedSubs > 0) {
-  const msg = `Ignoring ${droppedSubs} stored subscription(s) with no usable endpoint.`
+  const msg = `Ignoring ${droppedSubs} unusable stored subscription(s) (endpoint or push keys).`
   console.error(msg)
   // Surface it in the Actions run summary too: a stderr line in a green run is easy to
   // never read, and this one means someone is silently receiving no notifications.
