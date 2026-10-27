@@ -93,10 +93,6 @@ export default {
         } catch {
           /* unreadable previous value — overwrite it */
         }
-      } else {
-        // cap stored subscriptions so junk POSTs can't flood KV or the push cron
-        const list = await env.SUBS.list({ prefix: 'sub:', limit: 25 })
-        if (list.keys.length >= 20) return json({ error: 'subscription limit reached' }, 429)
       }
 
       // Reinstalling a PWA mints a brand-new push endpoint while the old one keeps
@@ -104,9 +100,10 @@ export default {
       // prior registrations for this team on this device kind; a genuinely different
       // device reports a different kind and survives. Entries stored before `device`
       // existed carry none, so they match and get upgraded rather than lingering.
+      // Identified here, but not deleted until the cap check below has passed.
+      const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
       const stale = []
       if (teamId) {
-        const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
         for (const k of list.keys) {
           if (k.name === key) continue
           const raw = await env.SUBS.get(k.name)
@@ -117,13 +114,32 @@ export default {
           } catch {
             continue
           }
+          // JSON.parse('null') succeeds, as do a bare string or number, and any of them
+          // would throw on the field access below and 500 the whole registration.
+          if (!prev || typeof prev !== 'object') continue
           if (prev.teamId !== teamId) continue
           if (device && prev.device && prev.device !== device) continue
           stale.push(k.name)
         }
-        for (const name of stale) await env.SUBS.delete(name)
       }
 
+      // Cap stored subscriptions so junk POSTs can't flood KV or the push cron — but
+      // count what the retirement above will free first. A phone reinstalling at the cap
+      // replaces its own prior registration and does not grow the store; checking before
+      // the sweep turned that into a 429, locking a returning device out of a store its
+      // own stale entries were filling. Nothing is deleted until this passes, so a
+      // rejected request leaves the store exactly as it found it.
+      // A truncated page undercounts the store, and subtracting retirements from an
+      // undercount can admit past the cap. With limit 100 against a cap of 20 that only
+      // happens to a store already far over it, where rejecting is the right answer.
+      // Absence of the field counts as complete, so a KV response without it can never
+      // lock registration out.
+      const truncated = list.list_complete === false
+      if (!existing && (truncated || list.keys.length - stale.length >= 20)) {
+        return json({ error: 'subscription limit reached' }, 429)
+      }
+
+      for (const name of stale) await env.SUBS.delete(name)
       await env.SUBS.put(key, JSON.stringify({ subscription: body.subscription, teamId, device, t: Date.now() }))
       return json({ ok: true, replaced: stale.length })
     }
