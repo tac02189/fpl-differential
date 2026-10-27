@@ -304,15 +304,39 @@ if (current) {
   // exactly the old behaviour — so the two deploy in either order.
   const knownKeys = new Set(subs.map(subKeyOf))
   for (const s of rawSubs) if (!usableSub(s) && typeof s?.key === 'string' && s.key) knownKeys.add(s.key)
+  // One absence is not proof of departure. KV list reads are eventually consistent, so
+  // a live subscriber can be missing from a single /subs response; pruning on that one
+  // sighting drops its baseline, and its next status change then reads as first sight
+  // and sends nothing. So note when a subscriber first went missing and prune only once
+  // it has stayed missing for a while.
+  //
+  // Elapsed time, not a count of runs: runs are not evenly spaced. A few manual
+  // dispatches land seconds apart and would burn a three-run counter in minutes —
+  // pruning a live subscriber for exactly the reason this guard exists — while a GitHub
+  // outage would stretch the same three runs over days. Two hours is ~100x what KV
+  // takes to converge and still inside one typical gap between runs, so a subscriber
+  // that really did leave is cleaned up on the next run or the one after.
+  const ABSENT_GRACE_MS = 2 * 60 * 60 * 1000
+  state.absent ||= {}
   for (const k of Object.keys(state.seen)) {
     if (!knownKeys.has(k)) {
-      delete state.seen[k]
+      // Anything that is not a plausible past timestamp restarts the clock, so a value
+      // this script did not write cannot read as "absent since 1970" and prune at once.
+      const since = state.absent[k]
+      state.absent[k] = Number.isFinite(since) && since > 1e12 && since <= Date.now() ? since : Date.now()
+      if (Date.now() - state.absent[k] > ABSENT_GRACE_MS) {
+        delete state.seen[k]
+        delete state.absent[k]
+      }
       continue
     }
+    delete state.absent[k]
     const owned = ownedBy.get(k)
     if (!owned) continue
     for (const id of Object.keys(state.seen[k])) if (!owned.has(Number(id))) delete state.seen[k][id]
   }
+  // A counter for a subscriber whose baseline has already gone serves no purpose.
+  for (const k of Object.keys(state.absent)) if (!(k in state.seen)) delete state.absent[k]
 }
 
 // --- send, with one retry for transient failures ---
