@@ -249,8 +249,17 @@ export default {
       // Temporary duplicates for one user beat letting anyone delete anyone.
       //
       // Identified here, but not deleted until the cap check below has passed.
-      // One pass serves both the retirement sweep and the per-source count below, so
-      // the occupancy limit costs no extra reads.
+      // The sweep and the per-source count both need only two fields per record, and
+      // list() returns each key's metadata alongside its name. Reading them from there
+      // costs nothing: this loop used to fetch every stored value — a list plus a get
+      // per record, around 21 reads for a request that might be rejected outright, so
+      // a few thousand requests could exhaust a day's read quota and take registration
+      // down. Now it is one list, and the values are never read at all.
+      //
+      // Records written before metadata existed carry none, so they fall back to a get.
+      // That path is bounded and shrinking: every write from here on attaches metadata,
+      // so a legacy record costs one get until the next time its owner re-registers,
+      // and nothing can create a new one.
       const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
       const ipHash = await sourceKey(req, env)
       const stale = []
@@ -258,20 +267,22 @@ export default {
       let sameSourceStale = 0
       for (const k of list.keys) {
         if (k.name === key) continue
-        const raw = await env.SUBS.get(k.name)
-        if (!raw) continue
-        let prev
-        try {
-          prev = JSON.parse(raw)
-        } catch {
-          continue
+        let meta = k.metadata
+        if (!meta || typeof meta !== 'object') {
+          const raw = await env.SUBS.get(k.name)
+          if (!raw) continue
+          try {
+            meta = JSON.parse(raw)
+          } catch {
+            continue
+          }
+          // JSON.parse('null') succeeds, as do a bare string or number, and any of them
+          // would throw on the field accesses below and 500 the whole registration.
+          if (!meta || typeof meta !== 'object') continue
         }
-        // JSON.parse('null') succeeds, as do a bare string or number, and any of them
-        // would throw on the field accesses below and 500 the whole registration.
-        if (!prev || typeof prev !== 'object') continue
-        const isStale = !!installId && prev.installId === installId
+        const isStale = !!installId && meta.installId === installId
         if (isStale) stale.push(k.name)
-        if (ipHash && prev.ipHash === ipHash) {
+        if (ipHash && meta.ipHash === ipHash) {
           sameSource++
           if (isStale) sameSourceStale++
         }
@@ -323,6 +334,9 @@ export default {
           ipHash,
           t: Date.now(),
         }),
+        // Mirrored into metadata so the sweep above can read it straight off list().
+        // Both are short; KV allows 1024 bytes of metadata per key.
+        { metadata: { installId: keepInstallId, ipHash } },
       )
       return json({ ok: true, replaced: stale.length })
     }
