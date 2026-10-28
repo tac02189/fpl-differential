@@ -21,8 +21,16 @@ async function subKey(endpoint) {
 }
 
 // only real browser push services — rejects junk endpoints outright
+// Real endpoints run about 200 characters; 1024 is generous and still bounds what
+// GET /subs has to hold in one array. Picking three fields out of the body stopped
+// a caller attaching megabytes of EXTRA keys, but never bounded the three it kept.
+const MAX_ENDPOINT_CHARS = 1024
+// p256dh is 87 characters and auth 22. The ceiling is only there so the decoder is
+// never handed something enormous; the byte checks below are what actually validate.
+const MAX_PUSHKEY_CHARS = 200
+
 function validPushEndpoint(ep) {
-  if (typeof ep !== 'string') return false
+  if (typeof ep !== 'string' || ep.length > MAX_ENDPOINT_CHARS) return false
   try {
     const u = new URL(ep)
     if (u.protocol !== 'https:') return false
@@ -71,9 +79,15 @@ async function validPushKeys(k) {
   // Byte lengths, not character counts: web-push needs p256dh to decode to a 65-byte
   // uncompressed P-256 point and auth to at least 16 bytes.
   if (!k) return false
+  if (typeof k.p256dh !== 'string' || k.p256dh.length > MAX_PUSHKEY_CHARS) return false
+  if (typeof k.auth !== 'string' || k.auth.length > MAX_PUSHKEY_CHARS) return false
   const pub = b64urlDecode(k.p256dh)
   const auth = b64urlDecode(k.auth)
-  if (!pub || pub.length !== 65 || !auth || auth.length < 16) return false
+  // auth is 16 bytes in RFC 8291. The upper bound matters as much as the lower one:
+  // without it the decoder's tolerance for trailing '=' padding let an arbitrarily
+  // long string through, and the ORIGINAL string is what gets stored.
+  if (!pub || pub.length !== 65) return false
+  if (!auth || auth.length < 16 || auth.length > 64) return false
   // Length and the leading 0x04 are still not enough. A 65-byte blob that is not
   // actually a point on P-256 passes both, and then throws inside web-push with NO
   // status code — so sendOne can only read it as transient, no 404/410 ever arrives to
@@ -197,6 +211,106 @@ const INDEX_KEY = 'meta:subindex'
 // itself within five minutes without anyone having to maintain it.
 const INDEX_REBUILD_MS = 5 * 60 * 1000
 
+// --- the daily write budget ---------------------------------------------------
+// Rate limits are per minute; KV quotas are per day, and no useful per-minute rate
+// fits inside one. The throttle's 5 per 60s is 7200 requests a day against 1000
+// writes. A caller alternating /subscribe and /unsubscribe slips under every
+// occupancy cap — it deletes each record before making the next, so it never holds
+// more than one — while spending about three writes a cycle, so a single address
+// could exhaust the day's writes in roughly an hour.
+//
+// What breaks first is not registration. It is the cron's PUT /state, which then
+// cannot record what it has already sent, so every subscriber gets the same push
+// again on the next run and the one after. That is why there is a GLOBAL ceiling
+// as well as a per-source one: its job is not to beat the attacker, it is to keep
+// writes available for the cron no matter what the public endpoints are doing.
+// Refusing new registrations for a day is a far better failure than re-notifying
+// every existing subscriber every half hour.
+// 500, not a round half of the quota, because two write sources sit OUTSIDE this
+// budget and the sum has to fit inside 1000:
+//   - a forced index rebuild saves the index without being charged, since no
+//     registration happened to charge it to. The five-minute floor caps that at
+//     86400/300 = 288 a day.
+//   - the cron's PUT /state, about 48 a day at one run per half hour, plus retries.
+// 500 + 288 + 48 = 836, leaving real headroom. At 600 it was 936 of 1000, which
+// left nothing for a retry and would have put the thing this budget exists to
+// protect back at risk.
+const DAILY_WRITE_BUDGET = 500
+// A real device spends 3 on enabling push and a few more if it re-registers; 60 is
+// twenty registrations in a day. Tight enough that one address can take only an
+// eighth of the global ceiling, loose enough that no genuine user will meet it.
+const PER_SOURCE_WRITE_BUDGET = 60
+// The record, the index update beside it, and the index update that this record's
+// eventual /unsubscribe will spend. Charging the delete's write up front is what
+// lets /unsubscribe stay uninstrumented: you cannot delete what you could not
+// create, so bounding registrations bounds the whole cycle.
+const WRITES_PER_REGISTRATION = 3
+// KV quotas reset at 00:00 UTC, so the budget's day must be the UTC one.
+const utcDay = () => new Date().toISOString().slice(0, 10)
+
+// Rolls the counters over at the UTC boundary and repairs anything non-numeric,
+// so a malformed index can never read as 'budget already spent' and lock
+// registration out for the rest of the day.
+// Called exactly once per request, straight after the index is loaded, so the
+// admission check and the charge cannot land on different UTC days — a request that
+// passed at 23:59:59 would otherwise roll the counters itself and charge the new
+// day without ever being admitted against it.
+function rollBudget(idx) {
+  const day = utcDay()
+  if (idx.day !== day) {
+    idx.day = day
+    idx.used = 0
+    idx.src = {}
+  }
+  // Clamped, not merely type-checked. A stored `used` of 1e100 is finite and
+  // non-negative, so a type check passes it and every registration is refused for
+  // the rest of the day. Nothing legitimate can exceed the ceiling by more than one
+  // registration, so anything above that is corruption, and capping it there keeps
+  // a genuinely spent budget spent.
+  idx.used = clampSpend(idx.used, DAILY_WRITE_BUDGET)
+  if (!idx.src || typeof idx.src !== 'object' || Array.isArray(idx.src)) idx.src = {}
+  for (const k of Object.keys(idx.src)) {
+    // A negative source counter would hand that source unlimited registrations.
+    idx.src[k] = clampSpend(idx.src[k], PER_SOURCE_WRITE_BUDGET)
+  }
+}
+
+// Separates a spent budget from a corrupt one, which is the whole difficulty: both
+// look like a big number. chargeRegistration stops charging once the ceiling is
+// passed, so the largest value it can ever produce is ceiling + one registration.
+// A value inside that range is real spend and is kept EXACTLY — a spent budget must
+// stay spent. A value outside it cannot have been written by this code, so it is
+// discarded rather than clamped down to 'spent', which would refuse every
+// registration for the rest of the UTC day on the strength of a corrupt number.
+// Nothing a request can send reaches these fields, so discarding is not a bypass.
+function clampSpend(v, ceiling) {
+  if (!Number.isFinite(v) || v < 0 || v > ceiling + WRITES_PER_REGISTRATION) return 0
+  return v
+}
+
+// Both of these read counters that rollBudget has already normalised this request.
+function budgetAllows(idx, ipHash) {
+  if (idx.used + WRITES_PER_REGISTRATION > DAILY_WRITE_BUDGET) return false
+  if (!ipHash) return true
+  return (idx.src[ipHash] || 0) + WRITES_PER_REGISTRATION <= PER_SOURCE_WRITE_BUDGET
+}
+
+// The charge is applied to the index BEFORE it is saved, and the record is only
+// written once that save has succeeded — see the ordering in /subscribe. An earlier
+// version wrote the record first and charged after, and claimed the throttle made
+// a collision impossible because it 'only permits two registrations inside one
+// second from different sources'. That was simply wrong: 5 per 60s is a count per
+// window, not a spacing rule, so one source can burst five. Five record writes then
+// landed against a single surviving charge of 3, and at that ratio the real quota
+// ran out at about the same moment as the budget meant to protect it.
+function chargeRegistration(idx, ipHash) {
+  idx.used += WRITES_PER_REGISTRATION
+  if (ipHash) idx.src[ipHash] = (idx.src[ipHash] || 0) + WRITES_PER_REGISTRATION
+  // src cannot grow without bound: an entry only appears for a source that actually
+  // spent writes, and the global ceiling caps that at DAILY_WRITE_BUDGET /
+  // WRITES_PER_REGISTRATION entries before everything is refused anyway.
+}
+
 // Entries are [installId, ipHash]. A tuple rather than an object because 20 of them
 // share one value and KV caps a value well above that, but short keys cost nothing.
 async function readIndex(env) {
@@ -205,17 +319,21 @@ async function readIndex(env) {
   try {
     const i = JSON.parse(raw)
     if (!i || typeof i !== 'object') return null
-    if (!i.e || typeof i.e !== 'object' || Array.isArray(i.e)) return null
-    // A missing or absurd timestamp must force a rebuild, never freeze the index:
-    // treating junk as fresh would pin the roster to whatever it held forever.
-    if (!Number.isFinite(i.t) || i.t > Date.now() + 60000) return null
+    // A bad roster or timestamp forces a rebuild but must NOT discard the budget.
+    // Returning null here threw the counters away too, so corrupting the roster was
+    // a way to reset the day's spend. t = 0 guarantees the staleness check fires.
+    if (!i.e || typeof i.e !== 'object' || Array.isArray(i.e)) {
+      i.e = {}
+      i.t = 0
+    }
+    if (!Number.isFinite(i.t) || i.t > Date.now() + 60000) i.t = 0
     return i
   } catch {
     return null
   }
 }
 
-async function buildIndex(env) {
+async function buildIndex(env, prev) {
   const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
   const e = {}
   for (const k of list.keys) {
@@ -243,18 +361,30 @@ async function buildIndex(env) {
     }
     e[k.name] = [meta?.installId ?? null, meta?.ipHash ?? null]
   }
-  return { t: Date.now(), complete: list.list_complete !== false, e }
+  // The budget belongs to the day, not to what list() returned. Rebuilding it from
+  // scratch every five minutes would reset the counters 288 times a day and make
+  // the whole ceiling decorative.
+  return {
+    t: Date.now(),
+    complete: list.list_complete !== false,
+    e,
+    day: typeof prev?.day === 'string' ? prev.day : utcDay(),
+    used: Number.isFinite(prev?.used) ? prev.used : 0,
+    src: prev?.src && typeof prev.src === 'object' && !Array.isArray(prev.src) ? prev.src : {},
+  }
 }
 
-// Never let the index fail a registration. The record is already written by the time
-// this runs; an index that did not save is stale, and stale is what the rebuild floor
-// above exists to fix. KV also caps writes to one key at one per second, so two
-// registrations landing together can legitimately lose this write.
+// Reports whether the write landed. KV caps writes to one key at one per second and
+// throws 429 above that, which is reachable from a single source: the throttle
+// permits a burst of five inside one window. /subscribe treats a false here as a
+// reason to refuse the registration outright rather than proceed uncharged; the
+// best-effort callers ignore it.
 async function saveIndex(env, idx) {
   try {
     await env.SUBS.put(INDEX_KEY, JSON.stringify(idx))
+    return true
   } catch {
-    /* stale until the next rebuild, which is the designed failure */
+    return false
   }
 }
 
@@ -349,9 +479,15 @@ export default {
       let idx = await readIndex(env)
       let rebuilt = false
       if (!idx || Date.now() - idx.t > INDEX_REBUILD_MS) {
-        idx = await buildIndex(env)
+        // The old index is passed in so the rebuild inherits today's spend. It is
+        // null only when the index is absent or unreadable, which no request can
+        // cause; staleness alone still carries the counters forward.
+        idx = await buildIndex(env, idx)
         rebuilt = true
       }
+      // Once per request, before the admission check, so check and charge agree on
+      // which UTC day they are spending.
+      rollBudget(idx)
       // A rebuild must still be saved on the paths that reject below, or a caller
       // held at a cap rebuilds on every request and the five-minute floor never
       // engages. It must NOT be saved here, though: KV throws 429 on a second write
@@ -402,12 +538,13 @@ export default {
         return json({ error: 'subscription limit reached' }, 429)
       }
 
-      for (const name of stale) {
-        await env.SUBS.delete(name)
-        // Drop it from the index too, or the next registration finds it there,
-        // deletes it again, and spends another delete on a key already gone.
-        delete idx.e[name]
+      // Last gate before anything is written. Deliberately after the occupancy caps,
+      // which are about what the store holds; this one is about what today has cost.
+      if (!budgetAllows(idx, ipHash)) {
+        if (rebuilt) await saveIndex(env, idx)
+        return json({ error: 'registration budget exhausted for today' }, 429)
       }
+
       // Never downgrade a stored installId to null. A client whose storage is blocked,
       // or an older one that sends none, would otherwise strip that install's ability to
       // retire its own record later — silently, and permanently.
@@ -420,6 +557,33 @@ export default {
           /* unreadable previous value — nothing to carry over */
         }
       }
+
+      // RESERVE BEFORE SPENDING. The index write carries the charge, and it goes
+      // first: nothing else is written until it has landed.
+      //
+      // The other order — record first, charge after — looked safer, because a
+      // half-done registration then left an unindexed record rather than an index
+      // entry for a record that does not exist. But it made the budget unenforceable.
+      // One source may burst five requests inside a window; all five read the same
+      // counters, all five pass, all five write their own record key, and then their
+      // five index writes collide on KV's one-per-second limit so a single charge of
+      // 3 survives against six real writes. At that ratio the quota this budget
+      // defends ran out at about the same moment the budget did.
+      //
+      // Reserving first inverts the failure: the losers of that race write NOTHING
+      // and are told to retry, so a charge can never be smaller than what was spent.
+      // The cost is the opposite error — a charge with no record behind it, and an
+      // index entry for a record that was never written if the put below fails. Both
+      // over-count, which refuses a registration rather than admitting one, and the
+      // rebuild clears them within five minutes.
+      for (const name of stale) delete idx.e[name]
+      idx.e[key] = [keepInstallId ?? null, ipHash ?? null]
+      chargeRegistration(idx, ipHash)
+      if (!(await saveIndex(env, idx))) {
+        return json({ error: 'busy, retry shortly' }, 503)
+      }
+
+      for (const name of stale) await env.SUBS.delete(name)
       await env.SUBS.put(
         key,
         JSON.stringify({
@@ -435,20 +599,13 @@ export default {
         { metadata: { installId: keepInstallId, ipHash } },
       )
 
-      // Indexed only after the record itself is stored, so a failure between the two
-      // leaves a record the index has not seen — repaired at the next rebuild — rather
-      // than an index entry for a record that does not exist.
-      //
-      // Deletions are reflected too, here and from /unsubscribe. An earlier version
-      // left them to the rebuild, reasoning that an index listing a deleted record
-      // only over-counts, and over-counting merely rejects. That was wrong: an
-      // attacker can DRIVE the over-count. Alternating /subscribe and /unsubscribe
-      // under the throttle packs the index with entries whose records are gone, and
-      // at twenty of them every registration is refused — for everyone, while the
-      // store itself is empty. A rejection an attacker controls is a denial of
-      // service, not a safe direction to fail in.
-      idx.e[key] = [keepInstallId ?? null, ipHash ?? null]
-      await saveIndex(env, idx)
+      // The index was written above, before any of this. Deletions are reflected in
+      // it here and from /unsubscribe: an earlier version left them to the rebuild,
+      // reasoning that an index listing a deleted record only over-counts and
+      // over-counting merely rejects. That was wrong, because an attacker can DRIVE
+      // the over-count — alternating /subscribe and /unsubscribe packs the index with
+      // entries whose records are gone, and at twenty of them every registration is
+      // refused, for everyone, while the store itself is empty.
       return json({ ok: true, replaced: stale.length })
     }
 
