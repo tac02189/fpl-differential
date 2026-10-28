@@ -17,6 +17,29 @@ const deviceKind = () => {
   return 'other'
 }
 
+// A stable, unguessable id for this browser install — the only thing the worker can use
+// to tell "this phone re-registering with a fresh endpoint" from "someone else claiming
+// the same team". Team ids are public and prove nothing, so they used to let anyone
+// delete anyone's registrations. This never leaves the origin except in the body below.
+const INSTALL_ID_KEY = 'fpl:installId'
+const installId = () => {
+  try {
+    let id = localStorage.getItem(INSTALL_ID_KEY)
+    if (!id) {
+      id = crypto.randomUUID
+        ? crypto.randomUUID()
+        : [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('')
+      localStorage.setItem(INSTALL_ID_KEY, id)
+    }
+    return id
+  } catch {
+    // Storage blocked (private window, some embedded webviews). Send none: the worker
+    // then retires nothing, which is the safe direction — a duplicate notification is
+    // recoverable, a wrongly deleted registration is silent.
+    return null
+  }
+}
+
 export const pushSupported = () =>
   !!WORKER_URL && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window
 
@@ -41,7 +64,12 @@ export async function enablePush(teamId) {
     res = await fetch(`${WORKER_URL}/subscribe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subscription: sub.toJSON(), teamId: teamId || null, device: deviceKind() }),
+      body: JSON.stringify({
+        subscription: sub.toJSON(),
+        teamId: teamId || null,
+        device: deviceKind(),
+        installId: installId(),
+      }),
     })
   } catch {
     res = null

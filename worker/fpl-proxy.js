@@ -66,6 +66,13 @@ function validPushKeys(k) {
   return !!k && b64urlBytes(k.p256dh) === 65 && b64urlBytes(k.auth) >= 16
 }
 
+// A browser install's own identifier. Shape-checked only: its security comes from being
+// 128 bits of randomness that never leaves the owning browser, not from anything the
+// worker can verify about it.
+function validInstallId(v) {
+  return typeof v === 'string' && v.length >= 16 && v.length <= 100 && /^[A-Za-z0-9_-]+$/.test(v)
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url)
@@ -81,13 +88,23 @@ export default {
       const key = await subKey(body.subscription.endpoint)
       const teamId = body.teamId || null
       const device = typeof body.device === 'string' ? body.device.slice(0, 32) : null
+      // Which browser install this is. Random, client-generated, kept in that browser's
+      // own storage and never shown to anyone else — so it is the one thing a caller can
+      // actually prove it owns. Retirement below keys off it and nothing else.
+      const installId = validInstallId(body.installId) ? body.installId : null
       const existing = await env.SUBS.get(key)
-      const core = JSON.stringify({ subscription: body.subscription, teamId, device })
+      const core = JSON.stringify({ subscription: body.subscription, teamId, device, installId })
       if (existing) {
         // identical re-registration: skip the KV write (KV writes are the scarce quota)
         try {
           const prev = JSON.parse(existing)
-          if (JSON.stringify({ subscription: prev.subscription, teamId: prev.teamId, device: prev.device ?? null }) === core) {
+          const prevCore = {
+            subscription: prev.subscription,
+            teamId: prev.teamId,
+            device: prev.device ?? null,
+            installId: prev.installId ?? null,
+          }
+          if (JSON.stringify(prevCore) === core) {
             return json({ ok: true })
           }
         } catch {
@@ -97,13 +114,26 @@ export default {
 
       // Reinstalling a PWA mints a brand-new push endpoint while the old one keeps
       // accepting pushes for weeks, so the same phone ends up notified twice. Retire
-      // prior registrations for this team on this device kind; a genuinely different
-      // device reports a different kind and survives. Entries stored before `device`
-      // existed carry none, so they match and get upgraded rather than lingering.
+      // this installation's own earlier registrations.
+      //
+      // Matching used to be teamId plus device kind, which was not authorization at all.
+      // FPL team ids are public and the caller supplies its own, so posting a victim's
+      // team id with no `device` matched every registration that team had and deleted
+      // all of them — anyone could silence anyone. It also evicted real second devices,
+      // since two iPhones both report "ios". An installId is a secret only the owning
+      // browser holds, so a caller can only ever retire records it actually placed.
+      //
+      // The cost: a true reinstall clears storage and mints a new installId, so the old
+      // record is no longer recognised as this install's and lingers until its endpoint
+      // starts returning 404/410 and the cron unsubscribes it. That is unavoidable — to
+      // the worker a reinstalled app is indistinguishable from a different device
+      // claiming the same team, which is precisely the ambiguity the attack exploited.
+      // Temporary duplicates for one user beat letting anyone delete anyone.
+      //
       // Identified here, but not deleted until the cap check below has passed.
       const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
       const stale = []
-      if (teamId) {
+      if (installId) {
         for (const k of list.keys) {
           if (k.name === key) continue
           const raw = await env.SUBS.get(k.name)
@@ -117,8 +147,7 @@ export default {
           // JSON.parse('null') succeeds, as do a bare string or number, and any of them
           // would throw on the field access below and 500 the whole registration.
           if (!prev || typeof prev !== 'object') continue
-          if (prev.teamId !== teamId) continue
-          if (device && prev.device && prev.device !== device) continue
+          if (prev.installId !== installId) continue
           stale.push(k.name)
         }
       }
@@ -140,7 +169,7 @@ export default {
       }
 
       for (const name of stale) await env.SUBS.delete(name)
-      await env.SUBS.put(key, JSON.stringify({ subscription: body.subscription, teamId, device, t: Date.now() }))
+      await env.SUBS.put(key, JSON.stringify({ subscription: body.subscription, teamId, device, installId, t: Date.now() }))
       return json({ ok: true, replaced: stale.length })
     }
 
@@ -169,7 +198,17 @@ export default {
         // as first sight and record silently.
         const id = k.name.slice(4, 20)
         try {
-          out.push({ ...JSON.parse(v), key: id })
+          const parsed = JSON.parse(v)
+          // JSON.parse can hand back null or a primitive, which a rest pattern throws on.
+          if (!parsed || typeof parsed !== 'object') {
+            out.push({ key: id })
+          } else {
+            // installId stays inside the worker. Holding one is the capability to retire
+            // that registration, and the cron has no use for it — so a leaked SUBS_SECRET
+            // buys the ability to read subscriptions but still not to evict anybody.
+            const { installId: _withheld, ...rest } = parsed
+            out.push({ ...rest, key: id })
+          }
         } catch {
           // Unparseable value — still a subscriber that exists. Report the id alone
           // rather than throwing, which would 5xx the entire list.
