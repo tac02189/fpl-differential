@@ -184,6 +184,8 @@ export default {
       return new Response(null, { headers: { ...CORS, 'Access-Control-Max-Age': '86400' } })
     }
 
+    const authed = env.SUBS_SECRET && req.headers.get('Authorization') === `Bearer ${env.SUBS_SECRET}`
+
     if (url.pathname === '/subscribe' && req.method === 'POST') {
       if (await rateLimited(req, env, 'subscribe')) return json({ error: 'too many requests' }, 429)
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
@@ -345,11 +347,56 @@ export default {
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
       const body = await req.json().catch(() => null)
       if (!body?.endpoint) return json({ error: 'bad request' }, 400)
-      await env.SUBS.delete(await subKey(body.endpoint))
+
+      // The cron prunes endpoints the push services have declared dead, and it holds
+      // the secret, so it skips every guard below. Each one would break it: a run
+      // pruning more than the throttle allows would stall, narrowing the host list
+      // later would strand older records as permanently un-prunable, and the existence
+      // check can read stale (see there) and silently skip a prune that was wanted.
+      // Authentication here is a BYPASS, never a requirement — the PWA's own disable
+      // button sends no Authorization header, and demanding one would break it.
+      if (authed) {
+        await env.SUBS.delete(await subKey(body.endpoint))
+        return json({ ok: true })
+      }
+
+      // Everything below is quota defence. On the KV free plan deletes have their own
+      // allowance of 1000 a day, counted separately from the 1000 writes and the
+      // 100,000 reads, all resetting at 00:00 UTC. Unauthenticated, unthrottled and
+      // unconditional, this endpoint let anyone exhaust the delete allowance in
+      // seconds. Puts run on their own budget, so registration does not stop outright;
+      // what stops is every deletion the app depends on. The cron can no longer prune
+      // dead endpoints, and /subscribe can no longer retire a device's stale records,
+      // so once those fill the 20-record cap a returning device is locked out.
+      //
+      // 1. Shape first, because it costs nothing at all. /subscribe applies this exact
+      //    check at write time, so an endpoint that fails it cannot be in the store,
+      //    and rejecting it here spends no KV operation.
+      if (!validPushEndpoint(body.endpoint)) return json({ error: 'bad request' }, 400)
+      // 2. Then throttle, in its own bucket so unsubscribing cannot eat the
+      //    registration allowance or the reverse. A real user does this roughly once.
+      if (await rateLimited(req, env, 'unsubscribe')) return json({ error: 'too many requests' }, 429)
+      // 3. Then look before deleting. This moves the cheap attack onto a budget a
+      //    hundred times larger: a call naming an endpoint that was never stored now
+      //    spends a READ, and reads allow 100,000 a day against deletes' 1000.
+      //    It is a mitigation, not a bound, and two gaps are worth naming. The check
+      //    is not atomic with the delete, so concurrent calls naming an endpoint that
+      //    DOES exist can each read non-null and each spend one. And a host here is
+      //    only proof of shape, not of registration, so enough distinct sources can
+      //    still exhaust the read allowance. Both are narrowed by the throttle above,
+      //    which itself fails open. The reply is {ok:true} either way, so this does
+      //    not become an oracle for whether an endpoint is registered.
+      //    KV reads are eventually consistent, so this can also miss a record written
+      //    moments ago and skip a delete that was wanted, orphaning it. Recovery is
+      //    likely but not guaranteed, and it is not immediate: disablePush() calls
+      //    sub.unsubscribe() only AFTER this request returns, so the subscription is
+      //    still live at the moment of the check. The record clears only if that local
+      //    unsubscribe succeeds, a later push is attempted, the service answers
+      //    404/410, and the cron's own prune then lands.
+      const key = await subKey(body.endpoint)
+      if ((await env.SUBS.get(key)) !== null) await env.SUBS.delete(key)
       return json({ ok: true })
     }
-
-    const authed = env.SUBS_SECRET && req.headers.get('Authorization') === `Bearer ${env.SUBS_SECRET}`
 
     if (url.pathname === '/subs' && req.method === 'GET') {
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
@@ -376,8 +423,10 @@ export default {
             // SUBS_SECRET yields — it does NOT contain one. The response still carries
             // every subscription.endpoint, because the cron must have it to send, and
             // /unsubscribe deletes by bare endpoint, so a leaked secret still permits
-            // mass deletion. Fixing that means authenticating /unsubscribe, not hiding
-            // fields here.
+            // mass deletion — more directly since the bearer became /unsubscribe's
+            // bypass for the throttle and the existence check. Withholding fields here
+            // cannot fix that, and neither can authenticating /unsubscribe, which is
+            // what grants the unguarded path. Only rotating the secret does.
             // ipHash is withheld alongside installId: it is derived from a user's IP
             // address, and the cron has no use for it either.
             const { installId: _withheld, ipHash: _alsoWithheld, ...rest } = parsed

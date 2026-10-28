@@ -373,12 +373,20 @@ for (const item of queue) {
   let r = await sendOne(item.sub, item.payload)
   if (r === 'transient') r = await sendOne(item.sub, item.payload)
   if (r === 'gone') {
-    await fetch(`${WORKER_URL}/unsubscribe`, {
+    // Authenticated so the worker lets this through unthrottled. /unsubscribe stays
+    // public (the PWA's disable button sends no header), so it throttles anonymous
+    // callers and checks the record exists before spending a KV delete. A run pruning
+    // several dead endpoints would trip that throttle; the bearer skips it.
+    // fetch resolves on 4xx/5xx, so without this check a throttled or rejected
+    // prune still logged success — hiding exactly the quota exhaustion and
+    // misconfiguration this endpoint was hardened against.
+    const pruned = await fetch(`${WORKER_URL}/unsubscribe`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...AUTH },
       body: JSON.stringify({ endpoint: item.sub.subscription.endpoint }),
-    }).catch(() => {})
-    console.log('Pruned a dead subscription.')
+    }).catch(() => null)
+    if (pruned?.ok) console.log('Pruned a dead subscription.')
+    else console.error(`Could not prune a dead subscription (${pruned ? pruned.status : 'network error'}) — it stays stored; next run retries.`)
   }
   if (r === 'ok' || r === 'gone') {
     item.onDelivered?.()
