@@ -177,6 +177,98 @@ async function rateLimited(req, env, bucket) {
   }
 }
 
+// --- the subscriber index ---------------------------------------------------
+// list() spends a KV *list* operation, and the free plan allows 1000 a day against
+// 100,000 reads. /subscribe listed on every changed registration, which at the
+// throttle's 5 per 60s is 7200 a day from a single address — seven times the budget,
+// gone in about three hours. And GET /subs lists too, so exhausting it stopped the
+// cron as well: notifications went dark, not just registration.
+//
+// No rate this limiter can express fits inside 1000 a day, so the list had to go
+// rather than be throttled. The sweep needs exactly two fields per record, so the
+// whole roster lives in one key and is read with a get.
+// Deliberately outside the sub: namespace AND outside the bare prefix 'sub', so a
+// future list({ prefix: 'sub' }) written without the colon cannot sweep the index
+// up as a subscriber — GET /subs would slice(4, 20) it into nonsense.
+const INDEX_KEY = 'meta:subindex'
+// Rebuilding reconciles the index against KV, which is what repairs a lost update
+// when two registrations race. The floor is what stops a caller forcing a list per
+// request: at five minutes that is at most 288 a day, and a stale index corrects
+// itself within five minutes without anyone having to maintain it.
+const INDEX_REBUILD_MS = 5 * 60 * 1000
+
+// Entries are [installId, ipHash]. A tuple rather than an object because 20 of them
+// share one value and KV caps a value well above that, but short keys cost nothing.
+async function readIndex(env) {
+  const raw = await env.SUBS.get(INDEX_KEY)
+  if (!raw) return null
+  try {
+    const i = JSON.parse(raw)
+    if (!i || typeof i !== 'object') return null
+    if (!i.e || typeof i.e !== 'object' || Array.isArray(i.e)) return null
+    // A missing or absurd timestamp must force a rebuild, never freeze the index:
+    // treating junk as fresh would pin the roster to whatever it held forever.
+    if (!Number.isFinite(i.t) || i.t > Date.now() + 60000) return null
+    return i
+  } catch {
+    return null
+  }
+}
+
+async function buildIndex(env) {
+  const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
+  const e = {}
+  for (const k of list.keys) {
+    // EVERY listed key gets an entry, including one whose value is missing or
+    // unreadable. Its two fields may be unknown, but the key still occupies a slot,
+    // and dropping it here would quietly under-count the store against the cap —
+    // which the occupancy check reads as room. The old loop counted list.keys
+    // directly, so it never had that gap; the index has to preserve it deliberately.
+    let meta = k.metadata && typeof k.metadata === 'object' ? k.metadata : null
+    if (!meta) {
+      // Records written before metadata existed carry none. Bounded and shrinking:
+      // every write attaches metadata, and nothing can create a new one. It costs a
+      // get per legacy record, but only on a rebuild, not on every registration.
+      const raw = await env.SUBS.get(k.name)
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw)
+          // JSON.parse('null') succeeds, as do a bare string or number, and any of
+          // them would throw on the field reads below.
+          if (parsed && typeof parsed === 'object') meta = parsed
+        } catch {
+          /* unreadable value — the key still counts, with both fields unknown */
+        }
+      }
+    }
+    e[k.name] = [meta?.installId ?? null, meta?.ipHash ?? null]
+  }
+  return { t: Date.now(), complete: list.list_complete !== false, e }
+}
+
+// Never let the index fail a registration. The record is already written by the time
+// this runs; an index that did not save is stale, and stale is what the rebuild floor
+// above exists to fix. KV also caps writes to one key at one per second, so two
+// registrations landing together can legitimately lose this write.
+async function saveIndex(env, idx) {
+  try {
+    await env.SUBS.put(INDEX_KEY, JSON.stringify(idx))
+  } catch {
+    /* stale until the next rebuild, which is the designed failure */
+  }
+}
+
+// Keep the index honest when a record leaves outside /subscribe. Only ever updates
+// an index that already exists and already lists the key: a missing one is rebuilt
+// by the next registration, and listing here would put a list operation back on the
+// prune path, which is the cost this whole index exists to remove.
+async function dropFromIndex(env, name) {
+  const idx = await readIndex(env)
+  if (!idx || !(name in idx.e)) return
+  delete idx.e[name]
+  await saveIndex(env, idx)
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url)
@@ -251,40 +343,35 @@ export default {
       // Temporary duplicates for one user beat letting anyone delete anyone.
       //
       // Identified here, but not deleted until the cap check below has passed.
-      // The sweep and the per-source count both need only two fields per record, and
-      // list() returns each key's metadata alongside its name. Reading them from there
-      // costs nothing: this loop used to fetch every stored value — a list plus a get
-      // per record, around 21 reads for a request that might be rejected outright, so
-      // a few thousand requests could exhaust a day's read quota and take registration
-      // down. Now it is one list, and the values are never read at all.
-      //
-      // Records written before metadata existed carry none, so they fall back to a get.
-      // That path is bounded and shrinking: every write from here on attaches metadata,
-      // so a legacy record costs one get until the next time its owner re-registers,
-      // and nothing can create a new one.
-      const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
+      // Both the sweep and the per-source count need only two fields per record, and
+      // the index holds exactly those — so this reads one key instead of listing the
+      // store. See INDEX_KEY above for why the list could not simply be throttled.
+      let idx = await readIndex(env)
+      let rebuilt = false
+      if (!idx || Date.now() - idx.t > INDEX_REBUILD_MS) {
+        idx = await buildIndex(env)
+        rebuilt = true
+      }
+      // A rebuild must still be saved on the paths that reject below, or a caller
+      // held at a cap rebuilds on every request and the five-minute floor never
+      // engages. It must NOT be saved here, though: KV throws 429 on a second write
+      // to one key inside a second, saveIndex swallows that, and the surviving value
+      // would be this snapshot — which predates the record about to be written —
+      // carrying a fresh timestamp. The new record would then go unindexed for five
+      // minutes, under-counting the store, which is the direction that admits past
+      // the cap. So: exactly one saveIndex per request, on whichever path exits.
+
+      const names = Object.keys(idx.e)
       const ipHash = await sourceKey(req, env)
       const stale = []
       let sameSource = 0
       let sameSourceStale = 0
-      for (const k of list.keys) {
-        if (k.name === key) continue
-        let meta = k.metadata
-        if (!meta || typeof meta !== 'object') {
-          const raw = await env.SUBS.get(k.name)
-          if (!raw) continue
-          try {
-            meta = JSON.parse(raw)
-          } catch {
-            continue
-          }
-          // JSON.parse('null') succeeds, as do a bare string or number, and any of them
-          // would throw on the field accesses below and 500 the whole registration.
-          if (!meta || typeof meta !== 'object') continue
-        }
-        const isStale = !!installId && meta.installId === installId
-        if (isStale) stale.push(k.name)
-        if (ipHash && meta.ipHash === ipHash) {
+      for (const name of names) {
+        if (name === key) continue
+        const [eInstallId, eIpHash] = idx.e[name] || []
+        const isStale = !!installId && eInstallId === installId
+        if (isStale) stale.push(name)
+        if (ipHash && eIpHash === ipHash) {
           sameSource++
           if (isStale) sameSourceStale++
         }
@@ -294,6 +381,7 @@ export default {
       // re-registering a device never blocks itself. Skipped when the record already
       // exists: updating a registration in place adds nothing to the store.
       if (!existing && ipHash && sameSource - sameSourceStale >= MAX_PER_IP) {
+        if (rebuilt) await saveIndex(env, idx)
         return json({ error: 'too many subscriptions from this network' }, 429)
       }
 
@@ -308,12 +396,18 @@ export default {
       // happens to a store already far over it, where rejecting is the right answer.
       // Absence of the field counts as complete, so a KV response without it can never
       // lock registration out.
-      const truncated = list.list_complete === false
-      if (!existing && (truncated || list.keys.length - stale.length >= 20)) {
+      const truncated = idx.complete === false
+      if (!existing && (truncated || names.length - stale.length >= 20)) {
+        if (rebuilt) await saveIndex(env, idx)
         return json({ error: 'subscription limit reached' }, 429)
       }
 
-      for (const name of stale) await env.SUBS.delete(name)
+      for (const name of stale) {
+        await env.SUBS.delete(name)
+        // Drop it from the index too, or the next registration finds it there,
+        // deletes it again, and spends another delete on a key already gone.
+        delete idx.e[name]
+      }
       // Never downgrade a stored installId to null. A client whose storage is blocked,
       // or an older one that sends none, would otherwise strip that install's ability to
       // retire its own record later — silently, and permanently.
@@ -336,10 +430,25 @@ export default {
           ipHash,
           t: Date.now(),
         }),
-        // Mirrored into metadata so the sweep above can read it straight off list().
-        // Both are short; KV allows 1024 bytes of metadata per key.
+        // Mirrored into metadata so a rebuild can read it straight off list() without
+        // fetching values. Both are short; KV allows 1024 bytes of metadata per key.
         { metadata: { installId: keepInstallId, ipHash } },
       )
+
+      // Indexed only after the record itself is stored, so a failure between the two
+      // leaves a record the index has not seen — repaired at the next rebuild — rather
+      // than an index entry for a record that does not exist.
+      //
+      // Deletions are reflected too, here and from /unsubscribe. An earlier version
+      // left them to the rebuild, reasoning that an index listing a deleted record
+      // only over-counts, and over-counting merely rejects. That was wrong: an
+      // attacker can DRIVE the over-count. Alternating /subscribe and /unsubscribe
+      // under the throttle packs the index with entries whose records are gone, and
+      // at twenty of them every registration is refused — for everyone, while the
+      // store itself is empty. A rejection an attacker controls is a denial of
+      // service, not a safe direction to fail in.
+      idx.e[key] = [keepInstallId ?? null, ipHash ?? null]
+      await saveIndex(env, idx)
       return json({ ok: true, replaced: stale.length })
     }
 
@@ -356,7 +465,9 @@ export default {
       // Authentication here is a BYPASS, never a requirement — the PWA's own disable
       // button sends no Authorization header, and demanding one would break it.
       if (authed) {
-        await env.SUBS.delete(await subKey(body.endpoint))
+        const pruned = await subKey(body.endpoint)
+        await env.SUBS.delete(pruned)
+        await dropFromIndex(env, pruned)
         return json({ ok: true })
       }
 
@@ -394,13 +505,21 @@ export default {
       //    unsubscribe succeeds, a later push is attempted, the service answers
       //    404/410, and the cron's own prune then lands.
       const key = await subKey(body.endpoint)
-      if ((await env.SUBS.get(key)) !== null) await env.SUBS.delete(key)
+      if ((await env.SUBS.get(key)) !== null) {
+        await env.SUBS.delete(key)
+        await dropFromIndex(env, key)
+      }
       return json({ ok: true })
     }
 
     if (url.pathname === '/subs' && req.method === 'GET') {
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
       if (!authed) return json({ error: 'unauthorized' }, 401)
+      // This list stays, deliberately. It is the cron's read of who exists, and the
+      // index is a cache that can lag — serving it from there would let a subscriber
+      // the index has not caught up with silently stop receiving notifications. One
+      // list per cron run is about 48 a day against 1000; the registration path was
+      // the one that could not afford it.
       const list = await env.SUBS.list({ prefix: 'sub:' })
       const out = []
       for (const k of list.keys) {
