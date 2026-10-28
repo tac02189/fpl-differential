@@ -104,6 +104,50 @@ function validInstallId(v) {
   return typeof v === 'string' && v.length >= 16 && v.length <= 100 && /^[A-Za-z0-9_-]+$/.test(v)
 }
 
+// Registering is a rare, human act — somebody toggling alerts, not a loop. Throttling
+// it per IP is what keeps a single source from burning the KV read quota: a rejected
+// /subscribe still costs a list plus a get for every stored record, so a few thousand
+// requests could exhaust a day's reads and take the CORS proxy down with the alerts.
+// Checked before any KV work, so a throttled request costs nothing at all.
+//
+// Fails OPEN when the binding or the IP header is missing — a local run, or a deploy
+// whose config lost the binding. Losing throttling is better than losing registration:
+// this is a safeguard around the store, not the thing that keeps the store correct.
+// How many stored records one source may hold. Throttling bounds how FAST a source can
+// register; it barely touches how MANY slots it ends up with, since filling twenty at
+// five a minute takes four minutes. This is the part that stops one origin owning the
+// store. Six is well above a household — phone, laptop, tablet, a spare — and leaves
+// an attacker needing four separate networks rather than a loop. A shared network (a
+// hospital or office behind one NAT) could legitimately exceed it, which is why the
+// error says "from this network" rather than something a user would read as a bug.
+const MAX_PER_IP = 6
+
+// Salted with SUBS_SECRET because an unsalted hash of an IPv4 address is reversible by
+// brute force in seconds — the whole space is 2^32. The salt never leaves the worker,
+// and the digest is withheld from GET /subs, so this identifies a source to the cap
+// check without storing anywhere who that source is. Null (no header, no secret) means
+// the check is skipped.
+async function sourceKey(req, env) {
+  const ip = req.headers.get('CF-Connecting-IP')
+  if (!ip || !env.SUBS_SECRET) return null
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${env.SUBS_SECRET}:ip:${ip}`))
+  return [...new Uint8Array(buf)]
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 16)
+}
+
+async function rateLimited(req, env, bucket) {
+  const ip = req.headers.get('CF-Connecting-IP')
+  if (!env.SUBSCRIBE_LIMIT || !ip) return false
+  try {
+    const { success } = await env.SUBSCRIBE_LIMIT.limit({ key: `${bucket}:${ip}` })
+    return !success
+  } catch {
+    return false
+  }
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url)
@@ -112,6 +156,7 @@ export default {
     }
 
     if (url.pathname === '/subscribe' && req.method === 'POST') {
+      if (await rateLimited(req, env, 'subscribe')) return json({ error: 'too many requests' }, 429)
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
       const body = await req.json().catch(() => null)
       if (!validPushEndpoint(body?.subscription?.endpoint)) return json({ error: 'bad subscription' }, 400)
@@ -164,25 +209,39 @@ export default {
       // Temporary duplicates for one user beat letting anyone delete anyone.
       //
       // Identified here, but not deleted until the cap check below has passed.
+      // One pass serves both the retirement sweep and the per-source count below, so
+      // the occupancy limit costs no extra reads.
       const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
+      const ipHash = await sourceKey(req, env)
       const stale = []
-      if (installId) {
-        for (const k of list.keys) {
-          if (k.name === key) continue
-          const raw = await env.SUBS.get(k.name)
-          if (!raw) continue
-          let prev
-          try {
-            prev = JSON.parse(raw)
-          } catch {
-            continue
-          }
-          // JSON.parse('null') succeeds, as do a bare string or number, and any of them
-          // would throw on the field access below and 500 the whole registration.
-          if (!prev || typeof prev !== 'object') continue
-          if (prev.installId !== installId) continue
-          stale.push(k.name)
+      let sameSource = 0
+      let sameSourceStale = 0
+      for (const k of list.keys) {
+        if (k.name === key) continue
+        const raw = await env.SUBS.get(k.name)
+        if (!raw) continue
+        let prev
+        try {
+          prev = JSON.parse(raw)
+        } catch {
+          continue
         }
+        // JSON.parse('null') succeeds, as do a bare string or number, and any of them
+        // would throw on the field accesses below and 500 the whole registration.
+        if (!prev || typeof prev !== 'object') continue
+        const isStale = !!installId && prev.installId === installId
+        if (isStale) stale.push(k.name)
+        if (ipHash && prev.ipHash === ipHash) {
+          sameSource++
+          if (isStale) sameSourceStale++
+        }
+      }
+
+      // Records this install is about to retire do not count against its own source, so
+      // re-registering a device never blocks itself. Skipped when the record already
+      // exists: updating a registration in place adds nothing to the store.
+      if (!existing && ipHash && sameSource - sameSourceStale >= MAX_PER_IP) {
+        return json({ error: 'too many subscriptions from this network' }, 429)
       }
 
       // Cap stored subscriptions so junk POSTs can't flood KV or the push cron — but
@@ -216,7 +275,7 @@ export default {
       }
       await env.SUBS.put(
         key,
-        JSON.stringify({ subscription: body.subscription, teamId, device, installId: keepInstallId, t: Date.now() }),
+        JSON.stringify({ subscription: body.subscription, teamId, device, installId: keepInstallId, ipHash, t: Date.now() }),
       )
       return json({ ok: true, replaced: stale.length })
     }
@@ -258,7 +317,9 @@ export default {
             // /unsubscribe deletes by bare endpoint, so a leaked secret still permits
             // mass deletion. Fixing that means authenticating /unsubscribe, not hiding
             // fields here.
-            const { installId: _withheld, ...rest } = parsed
+            // ipHash is withheld alongside installId: it is derived from a user's IP
+            // address, and the cron has no use for it either.
+            const { installId: _withheld, ipHash: _alsoWithheld, ...rest } = parsed
             out.push({ ...rest, key: id })
           }
         } catch {
