@@ -96,22 +96,28 @@ if (!Array.isArray(rawSubs)) {
 // carrying no statusCode, which sendOne can only read as transient. So the push is
 // retried, deferred, and reddens every run that queues anything for that subscriber —
 // forever, because no 404/410 ever arrives to retire it. Dropping it here says so once.
-const b64urlBytes = s => {
+const b64url = s => {
   try {
-    return Buffer.from(s, 'base64url').length
+    return typeof s === 'string' ? Buffer.from(s, 'base64url') : null
   } catch {
-    return 0
+    return null
   }
 }
 const usableSub = s => {
   const { endpoint, keys } = s?.subscription || {}
+  const pub = b64url(keys?.p256dh)
+  const auth = b64url(keys?.auth)
+  // 0x04 opens an uncompressed P-256 point. Checking it alongside the length rejects
+  // all-zero filler, which passes a pure length test and then throws inside web-push
+  // with no status code — a push that is retried and deferred on every run, for ever.
   return (
     typeof endpoint === 'string' &&
     endpoint.length > 0 &&
-    typeof keys?.p256dh === 'string' &&
-    b64urlBytes(keys.p256dh) === 65 &&
-    typeof keys?.auth === 'string' &&
-    b64urlBytes(keys.auth) >= 16
+    !!pub &&
+    pub.length === 65 &&
+    pub[0] === 0x04 &&
+    !!auth &&
+    auth.length >= 16
   )
 }
 const subs = rawSubs.filter(usableSub)
@@ -216,12 +222,24 @@ if (TEST_PUSH === 'true' || TEST_PUSH === '1') {
 // injury baseline gets wiped (this includes the post-deadline window where the new
 // GW's picks aren't published yet).
 const picksCache = new Map()
+// A stored teamId is whatever JSON the public /subscribe accepted. Coercing it is not
+// safe: String({toString: null}) throws, and the coercion below sits outside the try,
+// so one poisoned record would abort the entire run before any push was sent. The
+// worker rejects such values now, but records predating that check are still stored.
+const teamIdOf = v => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && /^[0-9]{1,12}$/.test(v) ? Number(v) : NaN
+  return Number.isInteger(n) && n > 0 ? String(n) : null
+}
+
 async function ownedPlayers(teamId) {
   if (!teamId || !current) return []
-  const key = String(teamId)
+  const key = teamIdOf(teamId)
+  // Present but unusable: "squad unknown", never "owns nothing" — otherwise a malformed
+  // stored value would wipe that subscriber's injury baseline on the next prune.
+  if (!key) return null
   if (!picksCache.has(key)) {
     try {
-      const d = await fpl(`entry/${teamId}/event/${current.id}/picks/`)
+      const d = await fpl(`entry/${key}/event/${current.id}/picks/`)
       picksCache.set(key, d.picks.map(p => p.element))
     } catch {
       picksCache.set(key, null)

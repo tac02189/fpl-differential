@@ -20,7 +20,8 @@ const deviceKind = () => {
 // A stable, unguessable id for this browser install — the only thing the worker can use
 // to tell "this phone re-registering with a fresh endpoint" from "someone else claiming
 // the same team". Team ids are public and prove nothing, so they used to let anyone
-// delete anyone's registrations. This never leaves the origin except in the body below.
+// delete anyone's registrations. Treat it as a bearer credential: it is sent to the
+// worker below and stored there, so same-origin script access is its trust boundary.
 const INSTALL_ID_KEY = 'fpl:installId'
 const installId = () => {
   try {

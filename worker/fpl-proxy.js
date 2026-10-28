@@ -44,18 +44,27 @@ function validPushEndpoint(ep) {
 // self-heals. Browsers always supply both through PushSubscription.toJSON(). The
 // lengths are floors, not exact sizes (p256dh is 87 chars, auth 22), so a future
 // encoding change cannot lock subscribers out.
-// Decoded byte length of a base64url string, or -1 if it is not base64url at all.
-function b64urlBytes(s) {
+// Decoded bytes of a base64url string, or null if it is not base64url at all.
+function b64urlDecode(s) {
   // Accept the standard alphabet as well as base64url: browsers emit base64url, but
   // being strict here would lock out a client for an encoding choice, which is the one
   // failure this validator must not cause.
-  if (typeof s !== 'string' || !/^[A-Za-z0-9+/_-]+=*$/.test(s)) return -1
+  if (typeof s !== 'string' || !/^[A-Za-z0-9+/_-]+=*$/.test(s)) return null
   const b = s.replace(/=+$/, '').replace(/-/g, '+').replace(/_/g, '/')
   try {
-    return atob(b + '='.repeat((4 - (b.length % 4)) % 4)).length
+    return atob(b + '='.repeat((4 - (b.length % 4)) % 4))
   } catch {
-    return -1
+    return null
   }
+}
+
+// A team id is stored here and later interpolated into a URL and coerced to a string by
+// the cron. String({toString: null}) throws, and that coercion happens outside the
+// cron's try block, so one such value stored through this public endpoint would abort
+// every notification run before a single push went out. Only plain positive integers.
+function validTeamId(v) {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && /^[0-9]{1,12}$/.test(v) ? Number(v) : NaN
+  return Number.isInteger(n) && n > 0 && n <= 1e12
 }
 
 function validPushKeys(k) {
@@ -63,12 +72,19 @@ function validPushKeys(k) {
   // uncompressed P-256 point and auth to at least 16 bytes. A record that merely looks
   // long enough still throws on every send, with no status code to mark it gone, so it
   // can never be auto-retired — it just reddens the cron and holds one of the 20 slots.
-  return !!k && b64urlBytes(k.p256dh) === 65 && b64urlBytes(k.auth) >= 16
+  // The 0x04 marker that opens an uncompressed point is checked too: it costs nothing
+  // and rejects all-zero filler that a pure length test would wave through into a slot.
+  if (!k) return false
+  const pub = b64urlDecode(k.p256dh)
+  const auth = b64urlDecode(k.auth)
+  return !!pub && pub.length === 65 && pub.charCodeAt(0) === 0x04 && !!auth && auth.length >= 16
 }
 
-// A browser install's own identifier. Shape-checked only: its security comes from being
-// 128 bits of randomness that never leaves the owning browser, not from anything the
-// worker can verify about it.
+// A browser install's own identifier. Shape-checked only — the worker cannot tell a
+// random value from a chosen one, so the security rests entirely on the client picking
+// a good one. The shipped client sends crypto.randomUUID (122 random bits) or 16 random
+// bytes as hex (128). A caller is free to send "aaaaaaaaaaaaaaaa" instead, which only
+// weakens that caller: guessing someone else's still means guessing their value.
 function validInstallId(v) {
   return typeof v === 'string' && v.length >= 16 && v.length <= 100 && /^[A-Za-z0-9_-]+$/.test(v)
 }
@@ -86,11 +102,13 @@ export default {
       if (!validPushEndpoint(body?.subscription?.endpoint)) return json({ error: 'bad subscription' }, 400)
       if (!validPushKeys(body.subscription.keys)) return json({ error: 'bad subscription keys' }, 400)
       const key = await subKey(body.subscription.endpoint)
-      const teamId = body.teamId || null
+      const teamId = validTeamId(body.teamId) ? Number(body.teamId) : null
       const device = typeof body.device === 'string' ? body.device.slice(0, 32) : null
-      // Which browser install this is. Random, client-generated, kept in that browser's
-      // own storage and never shown to anyone else — so it is the one thing a caller can
-      // actually prove it owns. Retirement below keys off it and nothing else.
+      // Which browser install this is: random, client-generated, and shared only between
+      // that browser and this worker — never published, and withheld from GET /subs
+      // below. It is a bearer credential, so anyone who obtains one can retire that
+      // install's records; what it buys is that a PUBLIC value no longer can.
+      // Retirement below keys off it and nothing else.
       const installId = validInstallId(body.installId) ? body.installId : null
       const existing = await env.SUBS.get(key)
       const core = JSON.stringify({ subscription: body.subscription, teamId, device, installId })
@@ -169,7 +187,22 @@ export default {
       }
 
       for (const name of stale) await env.SUBS.delete(name)
-      await env.SUBS.put(key, JSON.stringify({ subscription: body.subscription, teamId, device, installId, t: Date.now() }))
+      // Never downgrade a stored installId to null. A client whose storage is blocked,
+      // or an older one that sends none, would otherwise strip that install's ability to
+      // retire its own record later — silently, and permanently.
+      let keepInstallId = installId
+      if (!keepInstallId && existing) {
+        try {
+          const prev = JSON.parse(existing)
+          if (prev && typeof prev === 'object' && validInstallId(prev.installId)) keepInstallId = prev.installId
+        } catch {
+          /* unreadable previous value — nothing to carry over */
+        }
+      }
+      await env.SUBS.put(
+        key,
+        JSON.stringify({ subscription: body.subscription, teamId, device, installId: keepInstallId, t: Date.now() }),
+      )
       return json({ ok: true, replaced: stale.length })
     }
 
@@ -203,9 +236,13 @@ export default {
           if (!parsed || typeof parsed !== 'object') {
             out.push({ key: id })
           } else {
-            // installId stays inside the worker. Holding one is the capability to retire
-            // that registration, and the cron has no use for it — so a leaked SUBS_SECRET
-            // buys the ability to read subscriptions but still not to evict anybody.
+            // installId stays inside the worker: holding one is the capability to retire
+            // a registration, and the cron has no use for it. This narrows what a leaked
+            // SUBS_SECRET yields — it does NOT contain one. The response still carries
+            // every subscription.endpoint, because the cron must have it to send, and
+            // /unsubscribe deletes by bare endpoint, so a leaked secret still permits
+            // mass deletion. Fixing that means authenticating /unsubscribe, not hiding
+            // fields here.
             const { installId: _withheld, ...rest } = parsed
             out.push({ ...rest, key: id })
           }
