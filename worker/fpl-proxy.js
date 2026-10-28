@@ -67,17 +67,32 @@ function validTeamId(v) {
   return Number.isInteger(n) && n > 0 && n <= 1e12
 }
 
-function validPushKeys(k) {
+async function validPushKeys(k) {
   // Byte lengths, not character counts: web-push needs p256dh to decode to a 65-byte
-  // uncompressed P-256 point and auth to at least 16 bytes. A record that merely looks
-  // long enough still throws on every send, with no status code to mark it gone, so it
-  // can never be auto-retired — it just reddens the cron and holds one of the 20 slots.
-  // The 0x04 marker that opens an uncompressed point is checked too: it costs nothing
-  // and rejects all-zero filler that a pure length test would wave through into a slot.
+  // uncompressed P-256 point and auth to at least 16 bytes.
   if (!k) return false
   const pub = b64urlDecode(k.p256dh)
   const auth = b64urlDecode(k.auth)
-  return !!pub && pub.length === 65 && pub.charCodeAt(0) === 0x04 && !!auth && auth.length >= 16
+  if (!pub || pub.length !== 65 || !auth || auth.length < 16) return false
+  // Length and the leading 0x04 are still not enough. A 65-byte blob that is not
+  // actually a point on P-256 passes both, and then throws inside web-push with NO
+  // status code — so sendOne can only read it as transient, no 404/410 ever arrives to
+  // retire it, and the record reddens every run and holds one of the 20 slots for ever.
+  // importKey performs the real curve check, so such a record is never stored at all.
+  // That is deterministic, unlike inferring permanence from repeated delivery failures,
+  // which cannot tell a broken record from a push service having a bad afternoon.
+  try {
+    await crypto.subtle.importKey(
+      'raw',
+      Uint8Array.from(pub, ch => ch.charCodeAt(0)),
+      { name: 'ECDH', namedCurve: 'P-256' },
+      false,
+      [],
+    )
+    return true
+  } catch {
+    return false
+  }
 }
 
 // A browser install's own identifier. Shape-checked only — the worker cannot tell a
@@ -100,7 +115,7 @@ export default {
       if (!env.SUBS) return json({ error: 'KV not configured' }, 503)
       const body = await req.json().catch(() => null)
       if (!validPushEndpoint(body?.subscription?.endpoint)) return json({ error: 'bad subscription' }, 400)
-      if (!validPushKeys(body.subscription.keys)) return json({ error: 'bad subscription keys' }, 400)
+      if (!(await validPushKeys(body.subscription.keys))) return json({ error: 'bad subscription keys' }, 400)
       const key = await subKey(body.subscription.endpoint)
       const teamId = validTeamId(body.teamId) ? Number(body.teamId) : null
       const device = typeof body.device === 'string' ? body.device.slice(0, 32) : null
