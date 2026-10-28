@@ -116,19 +116,45 @@ function validInstallId(v) {
 // How many stored records one source may hold. Throttling bounds how FAST a source can
 // register; it barely touches how MANY slots it ends up with, since filling twenty at
 // five a minute takes four minutes. This is the part that stops one origin owning the
-// store. Six is well above a household — phone, laptop, tablet, a spare — and leaves
-// an attacker needing four separate networks rather than a loop. A shared network (a
-// hospital or office behind one NAT) could legitimately exceed it, which is why the
-// error says "from this network" rather than something a user would read as a bug.
-const MAX_PER_IP = 6
+// store.
+//
+// Twelve, raised from six, so that a shared network — a hospital or an office behind
+// one NAT, where everyone appears as a single address — can sign up without the
+// seventh person being refused. The honest trade: an attacker now needs two networks
+// instead of four, which is barely a barrier. What this still buys is that a single
+// source cannot take the store on its own, and a client stuck in a loop cannot either.
+// Any value meaningfully below the global cap of 20 buys that; values near it buy
+// nothing, which is the real reason not to raise this much further without raising the
+// global cap too.
+const MAX_PER_IP = 12
 
 // Salted with SUBS_SECRET because an unsalted hash of an IPv4 address is reversible by
 // brute force in seconds — the whole space is 2^32. The salt never leaves the worker,
 // and the digest is withheld from GET /subs, so this identifies a source to the cap
 // check without storing anywhere who that source is. Null (no header, no secret) means
 // the check is skipped.
-async function sourceKey(req, env) {
+// What counts as "one source". An IPv6 client is routed a whole /64 — 2^64 addresses —
+// so keying on the full address lets a single machine present as billions of distinct
+// clients and walk straight through both the throttle and the occupancy cap. Collapse
+// IPv6 to its /64 so a prefix counts once; IPv4 is already one address per client.
+function clientSource(req) {
   const ip = req.headers.get('CF-Connecting-IP')
+  if (!ip) return null
+  if (!ip.includes(':')) return ip
+  const [head, tail] = ip.split('::')
+  const h = head ? head.split(':') : []
+  const t = tail !== undefined && tail ? tail.split(':') : []
+  const groups = ip.includes('::') ? [...h, ...Array(Math.max(8 - h.length - t.length, 0)).fill('0'), ...t] : ip.split(':')
+  return (
+    groups
+      .slice(0, 4)
+      .map(g => (g || '0').toLowerCase().replace(/^0+(?=.)/, ''))
+      .join(':') + '::/64'
+  )
+}
+
+async function sourceKey(req, env) {
+  const ip = clientSource(req)
   if (!ip || !env.SUBS_SECRET) return null
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${env.SUBS_SECRET}:ip:${ip}`))
   return [...new Uint8Array(buf)]
@@ -138,11 +164,14 @@ async function sourceKey(req, env) {
 }
 
 async function rateLimited(req, env, bucket) {
-  const ip = req.headers.get('CF-Connecting-IP')
+  const ip = clientSource(req)
   if (!env.SUBSCRIBE_LIMIT || !ip) return false
   try {
     const { success } = await env.SUBSCRIBE_LIMIT.limit({ key: `${bucket}:${ip}` })
-    return !success
+    // `!success` would turn an unexpected shape (no boolean at all) into "throttled",
+    // i.e. 429 for everybody — the exact opposite of the fail-open this is supposed to
+    // be. Only an explicit false throttles.
+    return success === false
   } catch {
     return false
   }
@@ -170,8 +199,19 @@ export default {
       // install's records; what it buys is that a PUBLIC value no longer can.
       // Retirement below keys off it and nothing else.
       const installId = validInstallId(body.installId) ? body.installId : null
+      // Only the three fields a push actually needs. Storing body.subscription verbatim
+      // let a caller attach megabytes of their own, and GET /subs loads every record
+      // into one array — enough of that and the cron's own fetch runs the worker out of
+      // memory, breaking notifications for everyone with no way to self-heal. Built
+      // once here so the comparison below and the write further down agree; comparing a
+      // trimmed stored record against an untrimmed body would never match, and every
+      // re-registration would spend a KV write.
+      const subscription = {
+        endpoint: body.subscription.endpoint,
+        keys: { p256dh: body.subscription.keys.p256dh, auth: body.subscription.keys.auth },
+      }
       const existing = await env.SUBS.get(key)
-      const core = JSON.stringify({ subscription: body.subscription, teamId, device, installId })
+      const core = JSON.stringify({ subscription, teamId, device, installId })
       if (existing) {
         // identical re-registration: skip the KV write (KV writes are the scarce quota)
         try {
@@ -275,7 +315,14 @@ export default {
       }
       await env.SUBS.put(
         key,
-        JSON.stringify({ subscription: body.subscription, teamId, device, installId: keepInstallId, ipHash, t: Date.now() }),
+        JSON.stringify({
+          subscription,
+          teamId,
+          device,
+          installId: keepInstallId,
+          ipHash,
+          t: Date.now(),
+        }),
       )
       return json({ ok: true, replaced: stale.length })
     }
