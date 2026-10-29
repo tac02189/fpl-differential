@@ -17,10 +17,10 @@ const B = { subscription: { endpoint: 'https://fcm.googleapis.com/B' }, teamId: 
 const keyOf = s => s.subscription.endpoint.slice(-1)
 const subs = [A, B]
 
-let failures = 0
+let failures = 0, passes = 0
 const check = (label, got, want) => {
   const ok = JSON.stringify(got) === JSON.stringify(want)
-  if (!ok) failures++
+  ok ? passes++ : failures++
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${ok ? '' : `\n      got  ${JSON.stringify(got)}\n      want ${JSON.stringify(want)}`}`)
 }
 
@@ -76,5 +76,7 @@ check(
   ['A'],
 )
 
-console.log(failures ? `\n${failures} FAILED` : '\nall passed')
+// Same wording as the suites under test/, so the runner can count these checks
+// toward its total instead of reporting the suite as untallied.
+console.log(`\n${failures ? 'FAILED ' : ''}${passes} passed, ${failures} failed`)
 process.exit(failures ? 1 : 0)

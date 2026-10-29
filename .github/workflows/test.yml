@@ -1,0 +1,30 @@
+name: tests
+
+# The suites are pure Node — no install, no network, no secrets. That is why this
+# can run on every push without the registry-retry dance notify.yml needs: there is
+# nothing to install, so there is nothing to fail transiently.
+on:
+  push:
+    paths:
+      - 'worker/**'
+      - 'src/lib/push.js'        # msgmap.test.mjs reads this against the worker's 4xx strings
+      - 'scripts/notify.mjs'
+      - 'scripts/test-notify-plan.mjs'
+      - 'test/**'
+      - 'package.json'          # holds the `test` script this job runs
+      - '.github/workflows/test.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The run takes ~4s. The runner also times each suite out at 60s, so this is
+    # the outer net for a failure that stops the runner itself from finishing.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
