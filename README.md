@@ -23,8 +23,12 @@ read-only, no login; the app needs only a team ID and (optionally) a classic-lea
 
 - The FPL API sends no CORS headers. Dev uses Vite's proxy (`/fpl-api`); production routes through a
   Cloudflare Worker (`worker/fpl-proxy.js`) whose URL is injected at build time via `VITE_FPL_PROXY`.
-- Push notifications use standard Web Push (VAPID, no FCM console setup) with subscriptions stored in
-  Firestore and a GitHub Actions cron as the sender — deadline reminders (T-24h / T-2h) and injury alerts.
+- Push notifications use standard Web Push (VAPID, no FCM console setup) with subscriptions stored in the
+  same Worker's Cloudflare KV and a GitHub Actions cron as the sender — deadline reminders (T-24h / T-2h)
+  and injury alerts. An early plan put subscriptions in Firestore; that was superseded before launch, and
+  the project has no Firestore database.
+- Tests: `npm test` runs `test/run.mjs` — 17 suites, one process each, no dependencies. `npm test -- <name>`
+  runs one. CI runs the same thing on pushes touching the worker, the push client, the cron, or the tests.
 - Squads are private until each GW deadline passes — that's the API, not a bug. Pre-season, rankings lean
   on FPL's own projections and last season's per-90 rates (reliability-damped), blending to real data by GW6.
 
