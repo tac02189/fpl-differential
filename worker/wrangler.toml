@@ -13,3 +13,21 @@ id = "1636d1cf411f4eacb586c1bd200d278e"
 name = "SUBSCRIBE_LIMIT"
 namespace_id = "1001"
 simple = { limit = 5, period = 60 }
+
+# Serialized owner of the daily KV write budget. Counting it in KV could not give a
+# hard bound: every holder reads, decides, then writes, and two requests that read the
+# same number both pass while only one write survives. A Durable Object runs one
+# reservation at a time, so "is there room, and if so take it" is indivisible.
+#
+# new_sqlite_classes, not new_classes: the Workers Free plan only offers the SQLite
+# storage backend, and key-value backed namespaces need a paid plan. The free
+# allowance is 100,000 Durable Object requests and 100,000 rows written a day, against
+# the 1000 KV writes this meters — the accounting costs two orders of magnitude less
+# than the thing it accounts for.
+[[durable_objects.bindings]]
+name = "BUDGET"
+class_name = "WriteBudget"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WriteBudget"]

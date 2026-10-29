@@ -251,64 +251,18 @@ const utcDay = () => new Date().toISOString().slice(0, 10)
 // Rolls the counters over at the UTC boundary and repairs anything non-numeric,
 // so a malformed index can never read as 'budget already spent' and lock
 // registration out for the rest of the day.
-// Called exactly once per request, straight after the index is loaded, so the
-// admission check and the charge cannot land on different UTC days — a request that
-// passed at 23:59:59 would otherwise roll the counters itself and charge the new
-// day without ever being admitted against it.
-function rollBudget(idx) {
-  const day = utcDay()
-  if (idx.day !== day) {
-    idx.day = day
-    idx.used = 0
-    idx.src = {}
-  }
-  // Clamped, not merely type-checked. A stored `used` of 1e100 is finite and
-  // non-negative, so a type check passes it and every registration is refused for
-  // the rest of the day. Nothing legitimate can exceed the ceiling by more than one
-  // registration, so anything above that is corruption, and capping it there keeps
-  // a genuinely spent budget spent.
-  idx.used = clampSpend(idx.used, DAILY_WRITE_BUDGET)
-  if (!idx.src || typeof idx.src !== 'object' || Array.isArray(idx.src)) idx.src = {}
-  for (const k of Object.keys(idx.src)) {
-    // A negative source counter would hand that source unlimited registrations.
-    idx.src[k] = clampSpend(idx.src[k], PER_SOURCE_WRITE_BUDGET)
-  }
-}
-
 // Separates a spent budget from a corrupt one, which is the whole difficulty: both
-// look like a big number. chargeRegistration stops charging once the ceiling is
-// passed, so the largest value it can ever produce is ceiling + one registration.
-// A value inside that range is real spend and is kept EXACTLY — a spent budget must
-// stay spent. A value outside it cannot have been written by this code, so it is
-// discarded rather than clamped down to 'spent', which would refuse every
-// registration for the rest of the UTC day on the strength of a corrupt number.
-// Nothing a request can send reaches these fields, so discarding is not a bypass.
+// look like a big number. A reservation stops being granted once the ceiling is
+// passed, so the largest value that can ever be stored is ceiling + one
+// registration. A value inside that range is real spend and is kept EXACTLY — a
+// spent budget must stay spent. A value outside it cannot have been written by
+// this code, so it is discarded rather than read as 'spent', which would refuse
+// every registration for the rest of the UTC day on the strength of a corrupt
+// number. Nothing a request can send reaches these fields, so discarding is not a
+// bypass.
 function clampSpend(v, ceiling) {
   if (!Number.isFinite(v) || v < 0 || v > ceiling + WRITES_PER_REGISTRATION) return 0
   return v
-}
-
-// Both of these read counters that rollBudget has already normalised this request.
-function budgetAllows(idx, ipHash) {
-  if (idx.used + WRITES_PER_REGISTRATION > DAILY_WRITE_BUDGET) return false
-  if (!ipHash) return true
-  return (idx.src[ipHash] || 0) + WRITES_PER_REGISTRATION <= PER_SOURCE_WRITE_BUDGET
-}
-
-// The charge is applied to the index BEFORE it is saved, and the record is only
-// written once that save has succeeded — see the ordering in /subscribe. An earlier
-// version wrote the record first and charged after, and claimed the throttle made
-// a collision impossible because it 'only permits two registrations inside one
-// second from different sources'. That was simply wrong: 5 per 60s is a count per
-// window, not a spacing rule, so one source can burst five. Five record writes then
-// landed against a single surviving charge of 3, and at that ratio the real quota
-// ran out at about the same moment as the budget meant to protect it.
-function chargeRegistration(idx, ipHash) {
-  idx.used += WRITES_PER_REGISTRATION
-  if (ipHash) idx.src[ipHash] = (idx.src[ipHash] || 0) + WRITES_PER_REGISTRATION
-  // src cannot grow without bound: an entry only appears for a source that actually
-  // spent writes, and the global ceiling caps that at DAILY_WRITE_BUDGET /
-  // WRITES_PER_REGISTRATION entries before everything is refused anyway.
 }
 
 // Entries are [installId, ipHash]. A tuple rather than an object because 20 of them
@@ -319,9 +273,11 @@ async function readIndex(env) {
   try {
     const i = JSON.parse(raw)
     if (!i || typeof i !== 'object') return null
-    // A bad roster or timestamp forces a rebuild but must NOT discard the budget.
-    // Returning null here threw the counters away too, so corrupting the roster was
-    // a way to reset the day's spend. t = 0 guarantees the staleness check fires.
+    // A bad roster or timestamp forces a rebuild rather than discarding the record,
+    // and t = 0 guarantees the staleness check fires. (This mattered more when the
+    // write budget lived in here too: returning null threw its counters away, so
+    // corrupting the roster reset the day's spend. The Durable Object owns them now,
+    // out of reach of anything that touches the roster.)
     if (!i.e || typeof i.e !== 'object' || Array.isArray(i.e)) {
       i.e = {}
       i.t = 0
@@ -333,7 +289,7 @@ async function readIndex(env) {
   }
 }
 
-async function buildIndex(env, prev) {
+async function buildIndex(env) {
   const list = await env.SUBS.list({ prefix: 'sub:', limit: 100 })
   const e = {}
   for (const k of list.keys) {
@@ -361,17 +317,9 @@ async function buildIndex(env, prev) {
     }
     e[k.name] = [meta?.installId ?? null, meta?.ipHash ?? null]
   }
-  // The budget belongs to the day, not to what list() returned. Rebuilding it from
-  // scratch every five minutes would reset the counters 288 times a day and make
-  // the whole ceiling decorative.
-  return {
-    t: Date.now(),
-    complete: list.list_complete !== false,
-    e,
-    day: typeof prev?.day === 'string' ? prev.day : utcDay(),
-    used: Number.isFinite(prev?.used) ? prev.used : 0,
-    src: prev?.src && typeof prev.src === 'object' && !Array.isArray(prev.src) ? prev.src : {},
-  }
+  // No budget fields: the Durable Object owns those now, so a rebuild cannot
+  // disturb them and dropFromIndex cannot write a stale copy of them back.
+  return { t: Date.now(), complete: list.list_complete !== false, e }
 }
 
 // Reports whether the write landed. KV caps writes to one key at one per second and
@@ -397,6 +345,162 @@ async function dropFromIndex(env, name) {
   if (!idx || !(name in idx.e)) return
   delete idx.e[name]
   await saveIndex(env, idx)
+}
+
+// --- the budget's serialized owner -------------------------------------------
+// Counting a budget in KV cannot give a hard bound. Every holder does a read,
+// decides, then writes, and nothing stops two requests reading the same number: the
+// losers of the write race spend without being charged. Lowering the ceiling only
+// changes how much leaks.
+//
+// A Durable Object is the one primitive here that serializes. Every reservation goes
+// to the same instance, one at a time, so "is there room, and if so take it" is a
+// single indivisible step. The counters leave the KV index entirely, which also ends
+// a second leak: dropFromIndex writes back the whole index object, and used to carry
+// counters it had read before a concurrent registration charged against them.
+//
+// It also moves the metering off the scarce quota. On the free plan a Durable Object
+// gets 100,000 requests and 100,000 rows written a day, against the 1000 KV writes
+// this is protecting — two orders of magnitude of headroom to account for something
+// there is very little of.
+export class WriteBudget {
+  constructor(state) {
+    this.state = state
+  }
+
+  async fetch(req) {
+    const url = new URL(req.url)
+    const body = await req.json().catch(() => null)
+    const n = Number.isInteger(body?.n) && body.n > 0 && body.n <= 100 ? body.n : null
+    if (!n) return Response.json({ ok: false, reason: 'bad request' }, { status: 400 })
+    const source = typeof body.source === 'string' && body.source.length <= 64 ? body.source : null
+    const day = typeof body.day === 'string' && body.day.length === 10 ? body.day : null
+
+    if (url.pathname === '/reserve') return this.guard(() => this.reserve(source, n))
+    if (url.pathname === '/refund') return this.guard(() => this.refund(source, n, day))
+    return Response.json({ ok: false, reason: 'not found' }, { status: 404 })
+  }
+
+  // blockConcurrencyWhile is what makes this a reservation rather than a guess: it
+  // "executes an async callback while blocking any other events from being delivered
+  // to the Durable Object", so the read, the decision and the write cannot interleave
+  // with another caller's. The docs permit it outside the constructor and warn only
+  // that it costs throughput — irrelevant at five registrations a minute.
+  //
+  // They also warn that a callback which THROWS terminates and resets the object. So
+  // nothing is allowed to escape: a storage failure becomes a 503 the caller can
+  // retry, not a reset that drops every other in-flight reservation.
+  guard(work) {
+    return this.state.blockConcurrencyWhile(async () => {
+      try {
+        return await work()
+      } catch {
+        return Response.json({ ok: false, reason: 'storage' }, { status: 503 })
+      }
+    })
+  }
+
+  async reserve(source, n) {
+    const b = await this.load()
+    if (b.used + n > DAILY_WRITE_BUDGET) {
+      return Response.json({ ok: false, reason: 'global', day: b.day, used: b.used })
+    }
+    const mine = source ? b.src[source] || 0 : 0
+    if (source && mine + n > PER_SOURCE_WRITE_BUDGET) {
+      return Response.json({ ok: false, reason: 'source', day: b.day, used: b.used, mine })
+    }
+    b.used += n
+    if (source) b.src[source] = mine + n
+    await this.state.storage.put('b', b)
+    // The day goes back with the grant so a later refund can prove which day it is
+    // giving back to.
+    return Response.json({ ok: true, day: b.day, used: b.used, mine: source ? b.src[source] : 0 })
+  }
+
+  // Giving back a reservation whose writes never happened.
+  //
+  // A refund must name the day it was granted on. Without that, a reservation taken
+  // at 23:59:59 and refunded at 00:00:01 subtracts from the NEW day, erasing
+  // reservations other callers legitimately took after midnight — a refund that mints
+  // budget. A stale day has nothing to give back, so it is dropped.
+  //
+  // Floored at zero as well, so a duplicate or stray refund cannot mint budget either.
+  async refund(source, n, day) {
+    const b = await this.load()
+    if (day && day !== b.day) return Response.json({ ok: true, expired: true, used: b.used })
+    b.used = Math.max(0, b.used - n)
+    if (source && b.src[source] !== undefined) {
+      b.src[source] = Math.max(0, b.src[source] - n)
+    }
+    await this.state.storage.put('b', b)
+    return Response.json({ ok: true, day: b.day, used: b.used })
+  }
+
+  // Rolls over on the UTC date, where the KV quota resets. A value this code could
+  // have written is real spend and is kept exactly; one it could not is corruption
+  // and is discarded, rather than being read as "already spent" and refusing every
+  // registration until midnight.
+  async load() {
+    const stored = await this.state.storage.get('b')
+    const day = utcDay()
+    if (!stored || typeof stored !== 'object' || stored.day !== day) {
+      return { day, used: 0, src: {} }
+    }
+    const b = { day, used: clampSpend(stored.used, DAILY_WRITE_BUDGET), src: {} }
+    if (stored.src && typeof stored.src === 'object' && !Array.isArray(stored.src)) {
+      for (const k of Object.keys(stored.src)) {
+        b.src[k] = clampSpend(stored.src[k], PER_SOURCE_WRITE_BUDGET)
+      }
+    }
+    return b
+  }
+}
+
+// { status: 'ok' | 'global' | 'source' | 'unavailable', day }
+//
+// There is no fallback when the binding is missing. An earlier version kept the old
+// KV counters for that case, and the second mechanism was pure liability: it sat
+// unused and therefore untested in the real path, its own refund never persisted, and
+// it made every reader ask which budget was in force. A missing binding is a
+// deployment fault, and the honest response is the same as an unreachable object —
+// refuse, loudly, rather than quietly stop metering.
+//
+// Refusing is also the right direction on its merits. An unmetered write is what
+// takes the cron down; a caller can retry a 503 a second later, while the cron cannot
+// retry a quota it has already spent.
+async function reserveWrites(env, ipHash) {
+  if (!env.BUDGET) return { status: 'unavailable' }
+  try {
+    const stub = env.BUDGET.get(env.BUDGET.idFromName('writes'))
+    const res = await stub.fetch('https://budget.invalid/reserve', {
+      method: 'POST',
+      body: JSON.stringify({ source: ipHash, n: WRITES_PER_REGISTRATION }),
+    })
+    if (!res.ok) return { status: 'unavailable' }
+    const j = await res.json()
+    if (j?.ok) return { status: 'ok', day: j.day }
+    return { status: j?.reason === 'source' ? 'source' : 'global' }
+  } catch {
+    return { status: 'unavailable' }
+  }
+}
+
+// Hands back the writes that did not happen — `n`, not necessarily the whole
+// reservation, because a registration can fail after part of it has been spent.
+//
+// Best effort by design. A refund that does not land leaves the budget over-counted,
+// which refuses a later registration instead of admitting one, and clears at 00:00.
+async function refundWrites(env, ipHash, n, day) {
+  if (!env.BUDGET || n <= 0) return
+  try {
+    const stub = env.BUDGET.get(env.BUDGET.idFromName('writes'))
+    await stub.fetch('https://budget.invalid/refund', {
+      method: 'POST',
+      body: JSON.stringify({ source: ipHash, n, day }),
+    })
+  } catch {
+    /* over-counted until midnight, which only ever refuses */
+  }
 }
 
 export default {
@@ -479,15 +583,9 @@ export default {
       let idx = await readIndex(env)
       let rebuilt = false
       if (!idx || Date.now() - idx.t > INDEX_REBUILD_MS) {
-        // The old index is passed in so the rebuild inherits today's spend. It is
-        // null only when the index is absent or unreadable, which no request can
-        // cause; staleness alone still carries the counters forward.
-        idx = await buildIndex(env, idx)
+        idx = await buildIndex(env)
         rebuilt = true
       }
-      // Once per request, before the admission check, so check and charge agree on
-      // which UTC day they are spending.
-      rollBudget(idx)
       // A rebuild must still be saved on the paths that reject below, or a caller
       // held at a cap rebuilds on every request and the five-minute floor never
       // engages. It must NOT be saved here, though: KV throws 429 on a second write
@@ -540,8 +638,12 @@ export default {
 
       // Last gate before anything is written. Deliberately after the occupancy caps,
       // which are about what the store holds; this one is about what today has cost.
-      if (!budgetAllows(idx, ipHash)) {
+      // The reservation is taken BEFORE the writes it pays for and handed back below
+      // if any of them fail, so a charge can never be smaller than what was spent.
+      const reservation = await reserveWrites(env, ipHash)
+      if (reservation.status !== 'ok') {
         if (rebuilt) await saveIndex(env, idx)
+        if (reservation.status === 'unavailable') return json({ error: 'busy, retry shortly' }, 503)
         return json({ error: 'registration budget exhausted for today' }, 429)
       }
 
@@ -558,46 +660,50 @@ export default {
         }
       }
 
-      // RESERVE BEFORE SPENDING. The index write carries the charge, and it goes
-      // first: nothing else is written until it has landed.
+      // The index still goes before the record, for a different reason now that the
+      // charge lives elsewhere: if one of the two writes is going to fail, an index
+      // entry with no record behind it over-counts the store, which refuses a later
+      // registration, while a record the index has not seen under-counts it, which
+      // admits one past the cap. Only the first is a safe direction, and the rebuild
+      // clears it within five minutes either way.
       //
-      // The other order — record first, charge after — looked safer, because a
-      // half-done registration then left an unindexed record rather than an index
-      // entry for a record that does not exist. But it made the budget unenforceable.
-      // One source may burst five requests inside a window; all five read the same
-      // counters, all five pass, all five write their own record key, and then their
-      // five index writes collide on KV's one-per-second limit so a single charge of
-      // 3 survives against six real writes. At that ratio the quota this budget
-      // defends ran out at about the same moment the budget did.
-      //
-      // Reserving first inverts the failure: the losers of that race write NOTHING
-      // and are told to retry, so a charge can never be smaller than what was spent.
-      // The cost is the opposite error — a charge with no record behind it, and an
-      // index entry for a record that was never written if the put below fails. Both
-      // over-count, which refuses a registration rather than admitting one, and the
-      // rebuild clears them within five minutes.
+      // KV caps writes to one key at one per second and a source may burst five
+      // requests inside a throttle window, so losing this race is routine rather
+      // than exceptional. The loser writes nothing, hands its reservation back, and
+      // is told to retry.
       for (const name of stale) delete idx.e[name]
       idx.e[key] = [keepInstallId ?? null, ipHash ?? null]
-      chargeRegistration(idx, ipHash)
       if (!(await saveIndex(env, idx))) {
+        // Nothing was spent, so the whole reservation goes back.
+        await refundWrites(env, ipHash, WRITES_PER_REGISTRATION, reservation.day)
         return json({ error: 'busy, retry shortly' }, 503)
       }
 
       for (const name of stale) await env.SUBS.delete(name)
-      await env.SUBS.put(
-        key,
-        JSON.stringify({
-          subscription,
-          teamId,
-          device,
-          installId: keepInstallId,
-          ipHash,
-          t: Date.now(),
-        }),
-        // Mirrored into metadata so a rebuild can read it straight off list() without
-        // fetching values. Both are short; KV allows 1024 bytes of metadata per key.
-        { metadata: { installId: keepInstallId, ipHash } },
-      )
+      // Wrapped so a failed record write hands the reservation back rather than
+      // leaving the day charged for something that was never stored.
+      try {
+        await env.SUBS.put(
+          key,
+          JSON.stringify({
+            subscription,
+            teamId,
+            device,
+            installId: keepInstallId,
+            ipHash,
+            t: Date.now(),
+          }),
+          // Mirrored into metadata so a rebuild can read it straight off list()
+          // without fetching values. Both are short; KV allows 1024 bytes per key.
+          { metadata: { installId: keepInstallId, ipHash } },
+        )
+      } catch {
+        // One write of the three DID happen: the index save above, which cannot be
+        // taken back. Refunding the full reservation would hand back budget for a
+        // write that was really spent, so only the two that did not happen go back.
+        await refundWrites(env, ipHash, WRITES_PER_REGISTRATION - 1, reservation.day)
+        return json({ error: 'could not store the subscription' }, 503)
+      }
 
       // The index was written above, before any of this. Deletions are reflected in
       // it here and from /unsubscribe: an earlier version left them to the rebuild,
