@@ -245,6 +245,47 @@ const PER_SOURCE_WRITE_BUDGET = 60
 // lets /unsubscribe stay uninstrumented: you cannot delete what you could not
 // create, so bounding registrations bounds the whole cycle.
 const WRITES_PER_REGISTRATION = 3
+
+// Reads are metered too, and for the same reason as writes: 5 requests per 60s is
+// 7200 a day from one source, each spending a KV read or two, against 100,000 a
+// day. Seven or eight sources could drain it. The casualty there is worse than
+// registration — GET /subs is how the cron learns who to notify, so an exhausted
+// read quota stops notifications outright.
+//
+// 60,000 leaves 40,000 for the cron, which needs about 1,500 (a list plus a get per
+// record, 48 runs a day). 600 per source is 200 registrations or 300 unsubscribes
+// in a day, against the two or three a real device performs.
+//
+// The reservation is taken BEFORE any KV read, which gives the property that
+// matters: when the object itself runs out — its own free allowance is 100,000
+// requests a day — every public request is refused having touched no KV at all. So
+// the terminal state of any amount of abuse is 'registration is down, the cron is
+// fine', never the reverse.
+const DAILY_READ_BUDGET = 50000
+const PER_SOURCE_READ_BUDGET = 600
+const READS_PER_SUBSCRIBE = 3
+const READS_PER_UNSUBSCRIBE = 2
+// The most any one reservation can ask for, whichever currency. A counter can
+// legitimately overshoot its ceiling by exactly this much, when the last grant
+// before the ceiling is the largest one, and clampSpend uses it to tell a real
+// overshoot from a corrupt value.
+
+// Rebuilding the index is its own admission decision, because the five-minute
+// floor was never a bound. Nothing serialized it: concurrent requests all read the
+// same stale index, all decide to rebuild, and all spend a list. That re-opens the
+// scarcest quota of the lot — 1000 list operations a day — and GET /subs needs one
+// per cron run, so draining them stops notifications. The read reservation does not
+// help, since a list is not a read.
+//
+// So the object grants the rebuild too. It holds the cooldown, so exactly one of a
+// burst wins and the rest carry on with the index they already have. The daily
+// allowance is a backstop under the cooldown's natural 288.
+const DAILY_LIST_BUDGET = 300
+// A rebuild is a list plus a get for every record predating metadata. The store is
+// capped at 20, and in practice nothing is legacy any more, so 25 covers it with
+// room. Charged against reads at grant time, on top of the caller's own 3.
+const READS_PER_REBUILD = 25
+const MAX_SINGLE_RESERVATION = Math.max(WRITES_PER_REGISTRATION, READS_PER_REBUILD)
 // KV quotas reset at 00:00 UTC, so the budget's day must be the UTC one.
 const utcDay = () => new Date().toISOString().slice(0, 10)
 
@@ -252,16 +293,17 @@ const utcDay = () => new Date().toISOString().slice(0, 10)
 // so a malformed index can never read as 'budget already spent' and lock
 // registration out for the rest of the day.
 // Separates a spent budget from a corrupt one, which is the whole difficulty: both
-// look like a big number. A reservation stops being granted once the ceiling is
-// passed, so the largest value that can ever be stored is ceiling + one
-// registration. A value inside that range is real spend and is kept EXACTLY — a
+// look like a big number. A grant is refused outright when it would cross a
+// ceiling, so a counter should never exceed one; the slack below is defensive, for
+// a value written by an older version of this code. A plausible value is kept
+// EXACTLY — a
 // spent budget must stay spent. A value outside it cannot have been written by
 // this code, so it is discarded rather than read as 'spent', which would refuse
 // every registration for the rest of the UTC day on the strength of a corrupt
 // number. Nothing a request can send reaches these fields, so discarding is not a
 // bypass.
 function clampSpend(v, ceiling) {
-  if (!Number.isFinite(v) || v < 0 || v > ceiling + WRITES_PER_REGISTRATION) return 0
+  if (!Number.isFinite(v) || v < 0 || v > ceiling + MAX_SINGLE_RESERVATION) return 0
   return v
 }
 
@@ -375,9 +417,13 @@ export class WriteBudget {
     if (!n) return Response.json({ ok: false, reason: 'bad request' }, { status: 400 })
     const source = typeof body.source === 'string' && body.source.length <= 64 ? body.source : null
     const day = typeof body.day === 'string' && body.day.length === 10 ? body.day : null
+    // 'r' for reads, anything else for writes. Two currencies, one object, so a
+    // registration's read and write reservations serialize against each other.
+    const kind = body.kind === 'r' ? 'r' : 'w'
 
-    if (url.pathname === '/reserve') return this.guard(() => this.reserve(source, n))
-    if (url.pathname === '/refund') return this.guard(() => this.refund(source, n, day))
+    if (url.pathname === '/reserve') return this.guard(() => this.reserve(source, n, kind))
+    if (url.pathname === '/refund') return this.guard(() => this.refund(source, n, day, kind))
+    if (url.pathname === '/rebuild') return this.guard(() => this.rebuild())
     return Response.json({ ok: false, reason: 'not found' }, { status: 404 })
   }
 
@@ -400,21 +446,29 @@ export class WriteBudget {
     })
   }
 
-  async reserve(source, n) {
+  // Which pair of counters and which pair of ceilings this kind of reservation uses.
+  limits(kind) {
+    return kind === 'r'
+      ? { total: 'rused', per: 'rsrc', cap: DAILY_READ_BUDGET, each: PER_SOURCE_READ_BUDGET }
+      : { total: 'used', per: 'src', cap: DAILY_WRITE_BUDGET, each: PER_SOURCE_WRITE_BUDGET }
+  }
+
+  async reserve(source, n, kind) {
     const b = await this.load()
-    if (b.used + n > DAILY_WRITE_BUDGET) {
-      return Response.json({ ok: false, reason: 'global', day: b.day, used: b.used })
+    const L = this.limits(kind)
+    if (b[L.total] + n > L.cap) {
+      return Response.json({ ok: false, reason: 'global', day: b.day, used: b[L.total] })
     }
-    const mine = source ? b.src[source] || 0 : 0
-    if (source && mine + n > PER_SOURCE_WRITE_BUDGET) {
-      return Response.json({ ok: false, reason: 'source', day: b.day, used: b.used, mine })
+    const mine = source ? b[L.per][source] || 0 : 0
+    if (source && mine + n > L.each) {
+      return Response.json({ ok: false, reason: 'source', day: b.day, used: b[L.total], mine })
     }
-    b.used += n
-    if (source) b.src[source] = mine + n
+    b[L.total] += n
+    if (source) b[L.per][source] = mine + n
     await this.state.storage.put('b', b)
     // The day goes back with the grant so a later refund can prove which day it is
     // giving back to.
-    return Response.json({ ok: true, day: b.day, used: b.used, mine: source ? b.src[source] : 0 })
+    return Response.json({ ok: true, day: b.day, used: b[L.total], mine: source ? b[L.per][source] : 0 })
   }
 
   // Giving back a reservation whose writes never happened.
@@ -424,16 +478,43 @@ export class WriteBudget {
   // reservations other callers legitimately took after midnight — a refund that mints
   // budget. A stale day has nothing to give back, so it is dropped.
   //
-  // Floored at zero as well, so a duplicate or stray refund cannot mint budget either.
-  async refund(source, n, day) {
+  // Floored at zero, so a refund can never drive a counter negative. That is not the
+  // same as being safe against duplicates: two refunds of one grant, inside the same
+  // day, subtract twice and so erase somebody else's reservation. No caller here can
+  // issue one — each failure path refunds once and returns — but the flooring is not
+  // what would stop it.
+  async refund(source, n, day, kind) {
     const b = await this.load()
-    if (day && day !== b.day) return Response.json({ ok: true, expired: true, used: b.used })
-    b.used = Math.max(0, b.used - n)
-    if (source && b.src[source] !== undefined) {
-      b.src[source] = Math.max(0, b.src[source] - n)
+    const L = this.limits(kind)
+    if (day && day !== b.day) return Response.json({ ok: true, expired: true, used: b[L.total] })
+    b[L.total] = Math.max(0, b[L.total] - n)
+    if (source && b[L.per][source] !== undefined) {
+      b[L.per][source] = Math.max(0, b[L.per][source] - n)
     }
     await this.state.storage.put('b', b)
-    return Response.json({ ok: true, day: b.day, used: b.used })
+    return Response.json({ ok: true, day: b.day, used: b[L.total] })
+  }
+
+  // The cooldown and the list allowance both live here, so a burst of requests all
+  // seeing a stale index produces exactly ONE rebuild: whichever reaches the object
+  // first takes the grant, and the others are told no and reuse what they have.
+  // Serializing the read reservation alone never did this — the rebuild decision
+  // was still made independently by every caller afterwards.
+  async rebuild() {
+    const b = await this.load()
+    const now = Date.now()
+    if (Number.isFinite(b.lastRebuild) && now - b.lastRebuild < INDEX_REBUILD_MS) {
+      return Response.json({ ok: false, reason: 'cooldown' })
+    }
+    if (b.lists + 1 > DAILY_LIST_BUDGET) return Response.json({ ok: false, reason: 'lists' })
+    if (b.rused + READS_PER_REBUILD > DAILY_READ_BUDGET) return Response.json({ ok: false, reason: 'global' })
+    b.lastRebuild = now
+    b.lists += 1
+    // A rebuild's own reads are charged here rather than to the caller, which only
+    // reserved enough for an ordinary registration.
+    b.rused += READS_PER_REBUILD
+    await this.state.storage.put('b', b)
+    return Response.json({ ok: true, day: b.day })
   }
 
   // Rolls over on the UTC date, where the KV quota resets. A value this code could
@@ -444,12 +525,23 @@ export class WriteBudget {
     const stored = await this.state.storage.get('b')
     const day = utcDay()
     if (!stored || typeof stored !== 'object' || stored.day !== day) {
-      return { day, used: 0, src: {} }
+      // lastRebuild resets with the day, which allows one extra rebuild just after
+      // midnight. One list is not worth carrying state across the boundary for.
+      return { day, used: 0, src: {}, rused: 0, rsrc: {}, lists: 0, lastRebuild: 0 }
     }
-    const b = { day, used: clampSpend(stored.used, DAILY_WRITE_BUDGET), src: {} }
-    if (stored.src && typeof stored.src === 'object' && !Array.isArray(stored.src)) {
-      for (const k of Object.keys(stored.src)) {
-        b.src[k] = clampSpend(stored.src[k], PER_SOURCE_WRITE_BUDGET)
+    const b = {
+      day,
+      used: clampSpend(stored.used, DAILY_WRITE_BUDGET),
+      src: {},
+      rused: clampSpend(stored.rused, DAILY_READ_BUDGET),
+      rsrc: {},
+      lists: clampSpend(stored.lists, DAILY_LIST_BUDGET),
+      lastRebuild: Number.isFinite(stored.lastRebuild) && stored.lastRebuild <= Date.now() ? stored.lastRebuild : 0,
+    }
+    for (const [from, to, cap] of [['src', 'src', PER_SOURCE_WRITE_BUDGET], ['rsrc', 'rsrc', PER_SOURCE_READ_BUDGET]]) {
+      const m = stored[from]
+      if (m && typeof m === 'object' && !Array.isArray(m)) {
+        for (const k of Object.keys(m)) b[to][k] = clampSpend(m[k], cap)
       }
     }
     return b
@@ -468,13 +560,13 @@ export class WriteBudget {
 // Refusing is also the right direction on its merits. An unmetered write is what
 // takes the cron down; a caller can retry a 503 a second later, while the cron cannot
 // retry a quota it has already spent.
-async function reserveWrites(env, ipHash) {
+async function reserve(env, ipHash, n, kind) {
   if (!env.BUDGET) return { status: 'unavailable' }
   try {
     const stub = env.BUDGET.get(env.BUDGET.idFromName('writes'))
     const res = await stub.fetch('https://budget.invalid/reserve', {
       method: 'POST',
-      body: JSON.stringify({ source: ipHash, n: WRITES_PER_REGISTRATION }),
+      body: JSON.stringify({ source: ipHash, n, kind }),
     })
     if (!res.ok) return { status: 'unavailable' }
     const j = await res.json()
@@ -484,6 +576,28 @@ async function reserveWrites(env, ipHash) {
     return { status: 'unavailable' }
   }
 }
+
+const reserveWrites = (env, ipHash) => reserve(env, ipHash, WRITES_PER_REGISTRATION, 'w')
+
+// Asks the object whether THIS request is the one that rebuilds. Unreachable counts
+// as no, which is the safe answer: carrying on with a stale index costs nothing,
+// while rebuilding without a grant is the unbounded case.
+async function reserveRebuild(env) {
+  if (!env.BUDGET) return false
+  try {
+    const stub = env.BUDGET.get(env.BUDGET.idFromName('writes'))
+    const res = await stub.fetch('https://budget.invalid/rebuild', {
+      method: 'POST',
+      body: JSON.stringify({ n: 1 }),
+    })
+    if (!res.ok) return false
+    return (await res.json())?.ok === true
+  } catch {
+    return false
+  }
+}
+// Taken before the first KV read of a public request, so a refusal costs no quota.
+const reserveReads = (env, ipHash, n) => reserve(env, ipHash, n, 'r')
 
 // Hands back the writes that did not happen — `n`, not necessarily the whole
 // reservation, because a registration can fail after part of it has been spent.
@@ -496,7 +610,7 @@ async function refundWrites(env, ipHash, n, day) {
     const stub = env.BUDGET.get(env.BUDGET.idFromName('writes'))
     await stub.fetch('https://budget.invalid/refund', {
       method: 'POST',
-      body: JSON.stringify({ source: ipHash, n, day }),
+      body: JSON.stringify({ source: ipHash, n, day, kind: 'w' }),
     })
   } catch {
     /* over-counted until midnight, which only ever refuses */
@@ -518,6 +632,16 @@ export default {
       const body = await req.json().catch(() => null)
       if (!validPushEndpoint(body?.subscription?.endpoint)) return json({ error: 'bad subscription' }, 400)
       if (!(await validPushKeys(body.subscription.keys))) return json({ error: 'bad subscription keys' }, 400)
+
+      // Hoisted above the first KV read, because the read reservation is keyed on
+      // it. Hashing costs no quota; everything below this line does.
+      const ipHash = await sourceKey(req, env)
+      const readBudget = await reserveReads(env, ipHash, READS_PER_SUBSCRIBE)
+      if (readBudget.status !== 'ok') {
+        if (readBudget.status === 'unavailable') return json({ error: 'busy, retry shortly' }, 503)
+        return json({ error: 'read budget exhausted for today' }, 429)
+      }
+
       const key = await subKey(body.subscription.endpoint)
       const teamId = validTeamId(body.teamId) ? Number(body.teamId) : null
       const device = typeof body.device === 'string' ? body.device.slice(0, 32) : null
@@ -583,12 +707,22 @@ export default {
       let idx = await readIndex(env)
       let rebuilt = false
       if (!idx || Date.now() - idx.t > INDEX_REBUILD_MS) {
-        idx = await buildIndex(env)
-        rebuilt = true
+        if (await reserveRebuild(env)) {
+          idx = await buildIndex(env)
+          rebuilt = true
+        } else if (!idx) {
+          // No roster at all and not our turn to build one. The holder of the grant
+          // is writing it right now, so a retry in a moment finds it.
+          return json({ error: 'busy, retry shortly' }, 503)
+        }
+        // Otherwise: keep the stale index. It is at most five minutes behind, and
+        // every way it can be wrong is repaired by whoever does hold the grant.
       }
-      // A rebuild must still be saved on the paths that reject below, or a caller
-      // held at a cap rebuilds on every request and the five-minute floor never
-      // engages. It must NOT be saved here, though: KV throws 429 on a second write
+      // A rebuild must still be saved on the paths that reject below, or the work it
+      // just paid for is thrown away and the next request finds the same stale index.
+      // (The floor itself no longer depends on that save — the object holds the
+      // cooldown — but the saved roster is still what later requests read.)
+      // It must NOT be saved here, though: KV throws 429 on a second write
       // to one key inside a second, saveIndex swallows that, and the surviving value
       // would be this snapshot — which predates the record about to be written —
       // carrying a fresh timestamp. The new record would then go unindexed for five
@@ -596,7 +730,6 @@ export default {
       // the cap. So: exactly one saveIndex per request, on whichever path exits.
 
       const names = Object.keys(idx.e)
-      const ipHash = await sourceKey(req, env)
       const stale = []
       let sameSource = 0
       let sameSourceStale = 0
@@ -750,6 +883,15 @@ export default {
       // 2. Then throttle, in its own bucket so unsubscribing cannot eat the
       //    registration allowance or the reverse. A real user does this roughly once.
       if (await rateLimited(req, env, 'unsubscribe')) return json({ error: 'too many requests' }, 429)
+      // 2b. Then the read budget, before the existence check below spends one. A
+      //     miss costs a read and nothing else, so without this an endpoint that was
+      //     never stored could be probed 7200 times a day per source for free — and
+      //     draining reads stops GET /subs, which is how the cron finds subscribers.
+      const unsubReads = await reserveReads(env, await sourceKey(req, env), READS_PER_UNSUBSCRIBE)
+      if (unsubReads.status !== 'ok') {
+        if (unsubReads.status === 'unavailable') return json({ error: 'busy, retry shortly' }, 503)
+        return json({ error: 'read budget exhausted for today' }, 429)
+      }
       // 3. Then look before deleting. This moves the cheap attack onto a budget a
       //    hundred times larger: a call naming an endpoint that was never stored now
       //    spends a READ, and reads allow 100,000 a day against deletes' 1000.
