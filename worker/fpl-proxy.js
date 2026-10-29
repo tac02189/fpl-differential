@@ -201,11 +201,16 @@ function validInstallId(v) {
 // Twelve, raised from six, so that a shared network — a hospital or an office behind
 // one NAT, where everyone appears as a single address — can sign up without the
 // seventh person being refused. The honest trade: an attacker now needs two networks
-// instead of four, which is barely a barrier. What this still buys is that a single
-// source cannot take the store on its own, and a client stuck in a loop cannot either.
-// Any value meaningfully below the global cap of 20 buys that; values near it buy
-// nothing, which is the real reason not to raise this much further without raising the
-// global cap too.
+// instead of four, which is barely a barrier. What this buys is that a single source
+// cannot take the store on its own SEQUENTIALLY, and a client stuck in a loop cannot
+// either. Any value meaningfully below MAX_RECORDS buys that; values near it buy
+// nothing, which is the real reason not to raise this much further without raising
+// MAX_RECORDS too.
+//
+// It does NOT hold against concurrency, and that is measured, not supposed — see the
+// cap-check block in /subscribe. Twenty requests fired together from one source put
+// twenty records in the store against this limit of twelve. Sequential abuse is what
+// this bounds; simultaneous abuse is bounded only by the write budget and the throttle.
 const MAX_PER_IP = 12
 
 // Was 20. The cap's original job was 'junk POSTs must not flood KV or the push
@@ -861,11 +866,48 @@ export default {
       // (A true REINSTALL has lost that installId and is not helped by this.) Nothing
       // is deleted until this passes, so a rejected request leaves the store as it was.
       //
-      // Counted from the index, which is not serialized: two registrations that read
-      // it together can each save a version holding only their own addition, leaving
-      // a record that exists in KV but not in the roster. So this is a ceiling that
-      // can be briefly overshot, not a hard bound — the five-minute rebuild re-lists
-      // KV and repairs the count. The same caveat applies to MAX_PER_IP above.
+      // Counted from the index, which is NOT serialized, so under concurrency this is
+      // not a bound at all. Registrations that read the roster together each save a
+      // version holding only their own addition; the losers' entries vanish while
+      // their records stay in KV, so the roster under-counts and therefore keeps
+      // admitting. The rebuild repairs it within five minutes, but the error grows
+      // until then rather than staying put.
+      //
+      // Measured 2026-10-29 against this code, with ~2ms of KV latency to make the
+      // read-to-write window realistic (a zero-latency stub does not reproduce it and
+      // reports every cap holding):
+      //   49 seeded + 12 concurrent  -> 61 records stored, cap 50
+      //   3 seeded + 20 concurrent from ONE source -> 20 records, MAX_PER_IP 12,
+      //                                               roster reporting only 4
+      // So treat both caps as sequential limits. They are honest against a client in
+      // a loop and against ordinary use; they are not a defence against a burst.
+      //
+      // The obvious fix — move this roster into the WriteBudget Durable Object so
+      // read, decide and mutate are one indivisible step, as the budget counters
+      // already are — was designed and reviewed on 2026-10-29, and it is NOT
+      // sufficient. Do not reach for it without reading why:
+      //
+      //   The roster would be inside the lock; the KV record write and the stale
+      //   deletes stay outside it. So the roster can never represent operations in
+      //   flight. A rebuild landing between an admission and its KV write rebuilds
+      //   from a KV that does not contain the new record yet, erasing a live
+      //   admission and freeing its slot to someone else. Compensating for a failed
+      //   write needs an admission identity the design did not have, so a late
+      //   rollback can undo a LATER success. And a stale-delete list computed from
+      //   an earlier snapshot can delete a record that a newer registration just
+      //   wrote — which this code can already do today, independently of any of it.
+      //
+      // Serializing the roster does not make the registration lifecycle atomic, and
+      // only the lifecycle gives a hard bound. Doing KV I/O under the lock also adds
+      // a failure mode that does not exist now: blockConcurrencyWhile has a 30-second
+      // cap and RESETS the object when exceeded, which guard()'s try/catch cannot
+      // intercept because it is not an exception.
+      //
+      // Deliberately not done. The store has one real subscriber, so the exposure is
+      // theoretical, and the honest comparison is a briefly wrong cap against a
+      // distributed two-store operation that can erase a real registration. The
+      // design packet and the probes that produced the numbers above are in the
+      // session scratchpad.
       // A truncated page undercounts the store, and subtracting retirements from an
       // undercount can admit past the cap. With limit 100 against a cap of 50 that only
       // happens to a store already far over it, where rejecting is the right answer.
