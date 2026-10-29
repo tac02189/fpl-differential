@@ -351,7 +351,7 @@ const WRITES_PER_REGISTRATION = 3
 // read quota stops notifications outright.
 //
 // 60,000 leaves 40,000 for the cron, which needs about 1,500 (a list plus a get per
-// record, 48 runs a day). 600 per source is 200 registrations or 300 unsubscribes
+// record, 48 runs a day). 600 per source is 150 registrations or 300 unsubscribes
 // in a day, against the two or three a real device performs.
 //
 // The reservation is taken BEFORE any KV read, which gives the property that
@@ -361,7 +361,12 @@ const WRITES_PER_REGISTRATION = 3
 // fine', never the reverse.
 const DAILY_READ_BUDGET = 50000
 const PER_SOURCE_READ_BUDGET = 600
-const READS_PER_SUBSCRIBE = 3
+// Four, not three: the stale-delete guard re-reads the roster before acting on a
+// delete list computed earlier. Charged on every registration rather than only the
+// ones that sweep, because the reservation is taken before the request knows
+// whether it has anything to retire — over-reserving refuses, under-reserving
+// spends quota it was never charged for, and only the first of those is safe.
+const READS_PER_SUBSCRIBE = 4
 const READS_PER_UNSUBSCRIBE = 2
 // The most any one reservation can ask for, whichever currency. A counter can
 // legitimately overshoot its ceiling by exactly this much, when the last grant
@@ -409,6 +414,38 @@ function clampSpend(v, ceiling) {
 
 // Entries are [installId, ipHash]. A tuple rather than an object because 20 of them
 // share one value and KV caps a value well above that, but short keys cost nothing.
+// What the guard in /subscribe reads, and deliberately NOT readIndex.
+//
+// readIndex repairs a malformed roster into an empty one so the staleness check
+// fires and a rebuild happens. That is right for admission and exactly wrong for
+// deciding what to delete: an empty roster lists nothing, so every stale name would
+// look safe to remove — the guard would be most destructive precisely when the
+// roster is corrupt. It also catches the KV read itself, which readIndex does not:
+// its get sits outside its own try, so a rejected read would escape AFTER the
+// replacement was stored, turning a registration that succeeded into an error the
+// client then retries.
+//
+// Returns the entry map, or null meaning "could not establish what is live" — a
+// different answer from "nothing is live", and the only one that makes skipping the
+// deletes the conservative choice it is meant to be.
+async function liveEntries(env) {
+  let raw
+  try {
+    raw = await env.SUBS.get(INDEX_KEY)
+  } catch {
+    return null
+  }
+  if (!raw) return null
+  try {
+    const i = JSON.parse(raw)
+    if (!i || typeof i !== 'object') return null
+    if (!i.e || typeof i.e !== 'object' || Array.isArray(i.e)) return null
+    return i.e
+  } catch {
+    return null
+  }
+}
+
 async function readIndex(env) {
   const raw = await env.SUBS.get(INDEX_KEY)
   if (!raw) return null
@@ -993,7 +1030,53 @@ export default {
       }
 
       // Safe now: the replacement exists.
-      for (const name of stale) await env.SUBS.delete(name)
+      //
+      // `stale` was computed from a roster read several KV operations ago, and it is
+      // permission to delete a key based on that snapshot. By now one of those keys
+      // can belong to a NEWER registration: two overlapping calls for one installId,
+      // one moving to Y and one re-registering X, each see the other's record as
+      // stale and delete it, and the device is left with nothing though both writes
+      // returned 200. Measured on this code — it needs the losing delete to stall,
+      // which is why uniform-latency concurrency never reproduces it.
+      //
+      // So re-read the roster and treat it as the authority on what is still ours to
+      // retire. A name present again was put back by someone after our snapshot, and
+      // deleting it would destroy a live registration.
+      //
+      // This narrows the window; it does not close it. KV has no compare-and-delete,
+      // so nothing checked BEFORE a delete can bind a delete that then stalls. The
+      // schedule that survives: A writes Y and begins deleting X; B claims the roster,
+      // writes X, reads a roster without Y and deletes Y; A's stalled delete then
+      // removes X. Both guards passed and both records are gone.
+      //
+      // A reconciler working from one consistent listing does NOT close that either —
+      // a consistent snapshot still cannot stop a later delete racing a concurrent
+      // replacement. Closing it needs coordination with writers: a version or identity
+      // on the record that the delete can be made conditional on. See the cap-check
+      // block above for why the obvious serialization does not work either.
+      //
+      // Failing to read the roster means skipping the deletes, not doing them blind.
+      // The asymmetry is the whole point, though the cost of skipping is recurring
+      // rather than one-off: a retained registration draws an extra push on EVERY
+      // notification until its endpoint 404s and the cron prunes it, and an identical
+      // re-registration returns early without sweeping, so it does not repair it. A
+      // record wrongly deleted still costs more — that device loses every future
+      // alert, silently and permanently.
+      let retired = 0
+      if (stale.length) {
+        const live = await liveEntries(env)
+        for (const name of stale) {
+          if (!live || name in live) continue
+          try {
+            await env.SUBS.delete(name)
+            retired++
+          } catch {
+            // The replacement is stored, so the registration succeeded. A failed
+            // delete leaves a duplicate for the cron to prune on 404/410; turning it
+            // into an error would make the client retry something that already worked.
+          }
+        }
+      }
 
       // The index was written above, before any of this. Deletions are reflected in
       // it here and from /unsubscribe: an earlier version left them to the rebuild,
@@ -1002,7 +1085,10 @@ export default {
       // the over-count — alternating /subscribe and /unsubscribe packs the index with
       // entries whose records are gone, and at twenty of them every registration is
       // refused, for everyone, while the store itself is empty.
-      return json({ ok: true, replaced: stale.length })
+      // Retirements that actually happened, not candidates identified. The guard can
+      // skip one, and counting it as retired would hide exactly the case that leaves
+      // a duplicate behind.
+      return json({ ok: true, replaced: retired })
     }
 
     if (url.pathname === '/unsubscribe' && req.method === 'POST') {

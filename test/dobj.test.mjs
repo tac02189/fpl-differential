@@ -1,9 +1,10 @@
 // The Durable Object that owns the write budget. Consolidates what budget.test.mjs
 // used to assert against the KV counters, which no longer exist.
 import { pathToFileURL } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import {
   IDX, SECRET, IP, BUDGET, PER_SOURCE, PER_REG, today,
-  mkNamespace, usedIn, srcIn, mkEnv, reg, unreg, idxOf, setIdx, nSubs, EP,
+  mkNamespace, usedIn, srcIn, mkEnv, reg, unreg, idxOf, setIdx, nSubs, EP, mkKeys,
 } from './dostub.mjs'
 const mod = await import(pathToFileURL(process.env.WORKER_FILE).href)
 const w = mod.default
@@ -197,7 +198,12 @@ ok(PER_SOURCE * 8 <= BUDGET, 'one source can take at most an eighth of the globa
 
 console.log('--- reads are a second, separate currency ---')
 const rusedIn = n => (n._state._store.get('b') || {}).rused || 0
-const READ_CAP = 50000, PER_SOURCE_READS = 600, R_SUB = 3, R_UNSUB = 2
+const READ_CAP = 50000, PER_SOURCE_READS = 600, R_UNSUB = 2
+// Reserved up front, vs what a request actually spends. They diverged when the
+// stale-delete guard added a roster re-read that only a SWEEPING request makes:
+// a registration with nothing to retire still reads 3. One name for both is what
+// broke this assertion when the reservation moved, so they are now two.
+const R_SUB_RESERVED = 4, R_SUB_NOSWEEP = 3
 ns = ns0()
 await call(ns, '/reserve', { source: 'a', n: 10, kind: 'r' })
 ok(rusedIn(ns) === 10 && usedIn(ns) === 0, 'reserving reads does not touch the write counter')
@@ -266,6 +272,51 @@ ok(100000 - READ_CAP >= 20 * CRON_READS, '  the cron has ' + Math.floor((100000 
 ok(Math.ceil(READ_CAP / PER_SOURCE_READS) >= 50, 'it takes ' + Math.ceil(READ_CAP / PER_SOURCE_READS) + ' distinct sources to reach the global read ceiling, against the 7 or 8 that used to drain KV')
 
 
+console.log('--- a sweeping registration must not read more than it reserved ---')
+// The reservation went 3 -> 4 for the stale-delete guard's roster re-read. Nothing
+// measured that, so nothing confirmed 4 is actually the worst case — which is how a
+// constant sized against another constant goes quietly wrong.
+{
+  // (a) sweeping, no rebuild: the existing-record get, the roster read, and the
+  // guard's re-read. Three — the guard re-read stands in for the list it did not need.
+  const eA = mkEnv(WriteBudget)
+  const instA = randomUUID()
+  await w.fetch(new Request('https://x/subscribe', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': IP },
+    body: JSON.stringify({ subscription: { endpoint: EP('sw1'), keys: mkKeys() },
+      teamId: 7, installId: instA } ) }), eA)
+  let before = { ...eA.SUBS.ops }
+  const rA = await w.fetch(new Request('https://x/subscribe', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': IP },
+    body: JSON.stringify({ subscription: { endpoint: EP('sw2'), keys: mkKeys() },
+      teamId: 7, installId: instA } ) }), eA)
+  const sweepOnly = (eA.SUBS.ops.get - before.get) + (eA.SUBS.ops.list - before.list)
+  ok((await rA.json()).replaced === 1, 'a sweeping registration retires one')
+  ok(sweepOnly === R_SUB_NOSWEEP, '  and reads ' + R_SUB_NOSWEEP +
+    '  [' + sweepOnly + ']')
+
+  // (b) sweeping AND rebuilding in one request: the worst case for a current-format
+  // store, and the only thing that justifies reserving 4 rather than 3.
+  const eB = mkEnv(WriteBudget)
+  const instB = randomUUID()
+  await w.fetch(new Request('https://x/subscribe', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': IP },
+    body: JSON.stringify({ subscription: { endpoint: EP('wc1'), keys: mkKeys() },
+      teamId: 7, installId: instB } ) }), eB)
+  ageAll(eB)
+  before = { ...eB.SUBS.ops }
+  const rB = await w.fetch(new Request('https://x/subscribe', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': IP },
+    body: JSON.stringify({ subscription: { endpoint: EP('wc2'), keys: mkKeys() },
+      teamId: 7, installId: instB } ) }), eB)
+  const worst = (eB.SUBS.ops.get - before.get) + (eB.SUBS.ops.list - before.list)
+  ok((await rB.json()).replaced === 1, 'a registration that sweeps AND rebuilds retires one')
+  ok(worst === R_SUB_RESERVED, '  and reads exactly the ' + R_SUB_RESERVED +
+    ' it reserved  [' + worst + ']')
+  ok(worst > sweepOnly,
+    '  i.e. the reservation covers its own worst case, not just the common one')
+}
+
 console.log('--- the one place the flat charge undercounts: an index rebuild ---')
 // A rebuild adds a list and, for any record predating metadata, a get each. The
 // charge is a flat 3, so the overshoot has to be bounded by something.
@@ -280,10 +331,12 @@ const rebuildReads = async strip => {
 }
 const withMeta = await rebuildReads(false)
 const allLegacy = await rebuildReads(true)
-ok(withMeta === R_SUB, 'with metadata a rebuild reads exactly the ' + R_SUB + ' it reserved  [' + withMeta + ']')
+ok(withMeta === R_SUB_NOSWEEP,
+  'with metadata, a rebuild on a NON-sweeping registration reads ' + R_SUB_NOSWEEP +
+  ' of the ' + R_SUB_RESERVED + ' reserved  [' + withMeta + ']')
 console.log('      (that is the earlier metadata work paying off: the sweep never')
 console.log('       fetches a value, so the common rebuild does not undercount at all)')
-ok(allLegacy > R_SUB && allLegacy <= 25,
+ok(allLegacy > R_SUB_RESERVED && allLegacy <= 25,
   'all-legacy worst case reads ' + allLegacy + ', bounded by the 20-record cap')
 ok(288 * allLegacy + READ_CAP + CRON_READS <= 100000,
   '  even forced 288 times a day: ' + (288 * allLegacy) + ' overshoot + ' + READ_CAP + ' + ' + CRON_READS +

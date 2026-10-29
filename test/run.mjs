@@ -38,7 +38,7 @@ const SUITE_TIMEOUT_MS = Number(process.env.SUITE_TIMEOUT_MS) || 60_000
 // green — so the count has a floor. This is a constant sized against another
 // constant, which is exactly the pattern that rots; the difference is that this
 // one cannot rot quietly. Drop a suite and the run goes red naming this line.
-const EXPECTED_SUITES = 17
+const EXPECTED_SUITES = 18
 
 // The planner test predates this directory and lives beside the cron it covers.
 // It is listed rather than globbed so that moving it is a deliberate act.
