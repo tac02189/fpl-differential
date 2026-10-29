@@ -208,6 +208,33 @@ function validInstallId(v) {
 // global cap too.
 const MAX_PER_IP = 12
 
+// Was 20. The cap's original job was 'junk POSTs must not flood KV or the push
+// cron', and it was the only thing doing that job. It is not any more: the daily
+// write budget bounds how fast the store can grow at all, MAX_PER_IP bounds how
+// much of it one source can hold, and the throttle bounds the rate. A blunt
+// absolute ceiling is now the least of those controls, so it can be the loosest.
+//
+// Raising it gives the reinstall-at-cap lockout more headroom. It does not remove
+// it, and three things are worth being exact about. A true reinstall mints a new
+// installId, so the worker cannot recognise the old record as the same phone and
+// cannot retire it; at the cap the returning device is refused from a store its own
+// corpse is filling. That is not fixed by identifying the reinstall — nothing
+// survives one to identify it with, and every substitute (team id, device kind,
+// network) is public, forgeable, or shared with a genuine second device.
+//
+// Nor is the condition unreachable. MAX_PER_IP below has exactly the same lockout
+// and bites a single household first. And no control here bounds total occupancy:
+// the budgets bound growth per day, the throttle bounds rate, MAX_PER_IP bounds one
+// source. Given enough days and enough sources the store still fills.
+//
+// It also improves the ratio it is in tension with. One source could previously
+// hold 12 of 20 records, 60% of the store; it now holds 12 of 50, under a quarter.
+//
+// The ceiling stays well under buildIndex's list limit of 100, so a full store is
+// still one complete page and list_complete stays true. GET /subs holds the lot in
+// one array for the cron: fifty trimmed records is about 15 KB.
+const MAX_RECORDS = 50
+
 // Salted with SUBS_SECRET because an unsalted hash of an IPv4 address is reversible by
 // brute force in seconds — the whole space is 2^32. The salt never leaves the worker,
 // and the digest is withheld from GET /subs, so this identifies a source to the cap
@@ -347,10 +374,12 @@ const READS_PER_UNSUBSCRIBE = 2
 // burst wins and the rest carry on with the index they already have. The daily
 // allowance is a backstop under the cooldown's natural 288.
 const DAILY_LIST_BUDGET = 300
-// A rebuild is a list plus a get for every record predating metadata. The store is
-// capped at 20, and in practice nothing is legacy any more, so 25 covers it with
-// room. Charged against reads at grant time, on top of the caller's own 3.
-const READS_PER_REBUILD = 25
+// A rebuild is a list plus a get for every record predating metadata. Sized to the
+// record cap, because an all-legacy store at the cap is the worst case: 25 was
+// sized against a cap of 20 and silently stopped covering it when the cap moved.
+// In practice nothing is legacy any more. Charged against reads at grant time, on
+// top of the caller's own 3.
+const READS_PER_REBUILD = MAX_RECORDS + 5
 const MAX_SINGLE_RESERVATION = Math.max(WRITES_PER_REGISTRATION, READS_PER_REBUILD)
 // KV quotas reset at 00:00 UTC, so the budget's day must be the UTC one.
 const utcDay = () => new Date().toISOString().slice(0, 10)
@@ -813,24 +842,37 @@ export default {
       // Records this install is about to retire do not count against its own source, so
       // re-registering a device never blocks itself. Skipped when the record already
       // exists: updating a registration in place adds nothing to the store.
-      if (!existing && ipHash && sameSource - sameSourceStale >= MAX_PER_IP) {
+      // An UPDATE reassigns the record's ipHash to whoever sent it, and the check
+      // below used to run only for new records — so a caller could create records
+      // from many sources, then update each one from a single source and move the
+      // whole lot into that source's allocation without it ever being counted.
+      // Only its own endpoints are needed. A transfer into a source is an addition
+      // to that source, so it is checked like one.
+      const prevIpHash = existing ? (idx.e[key] || [])[1] ?? null : null
+      const movingSource = !!existing && !!ipHash && prevIpHash !== ipHash
+      if ((!existing || movingSource) && ipHash && sameSource - sameSourceStale >= MAX_PER_IP) {
         if (rebuilt) await saveIndex(env, idx)
         return json({ error: 'too many subscriptions from this network' }, 429)
       }
 
-      // Cap stored subscriptions so junk POSTs can't flood KV or the push cron — but
-      // count what the retirement above will free first. A phone reinstalling at the cap
-      // replaces its own prior registration and does not grow the store; checking before
-      // the sweep turned that into a 429, locking a returning device out of a store its
-      // own stale entries were filling. Nothing is deleted until this passes, so a
-      // rejected request leaves the store exactly as it found it.
+      // A ceiling on the store, counting what the retirement above will free first.
+      // A phone re-registering with its installId intact replaces its own prior record
+      // and does not grow the store; checking before the sweep turned that into a 429.
+      // (A true REINSTALL has lost that installId and is not helped by this.) Nothing
+      // is deleted until this passes, so a rejected request leaves the store as it was.
+      //
+      // Counted from the index, which is not serialized: two registrations that read
+      // it together can each save a version holding only their own addition, leaving
+      // a record that exists in KV but not in the roster. So this is a ceiling that
+      // can be briefly overshot, not a hard bound — the five-minute rebuild re-lists
+      // KV and repairs the count. The same caveat applies to MAX_PER_IP above.
       // A truncated page undercounts the store, and subtracting retirements from an
-      // undercount can admit past the cap. With limit 100 against a cap of 20 that only
+      // undercount can admit past the cap. With limit 100 against a cap of 50 that only
       // happens to a store already far over it, where rejecting is the right answer.
       // Absence of the field counts as complete, so a KV response without it can never
       // lock registration out.
       const truncated = idx.complete === false
-      if (!existing && (truncated || names.length - stale.length >= 20)) {
+      if (!existing && (truncated || names.length - stale.length >= MAX_RECORDS)) {
         if (rebuilt) await saveIndex(env, idx)
         return json({ error: 'subscription limit reached' }, 429)
       }
@@ -878,9 +920,11 @@ export default {
         return json({ error: 'busy, retry shortly' }, 503)
       }
 
-      for (const name of stale) await env.SUBS.delete(name)
-      // Wrapped so a failed record write hands the reservation back rather than
-      // leaving the day charged for something that was never stored.
+      // The record goes in BEFORE the old ones come out. The other order deleted a
+      // working registration and then, if this write failed, left the device with
+      // neither: alerts silently stopped during what was an ordinary endpoint
+      // replacement. Wrapped so a failure also hands the reservation back rather
+      // than leaving the day charged for something that was never stored.
       try {
         await env.SUBS.put(
           key,
@@ -900,9 +944,14 @@ export default {
         // One write of the three DID happen: the index save above, which cannot be
         // taken back. Refunding the full reservation would hand back budget for a
         // write that was really spent, so only the two that did not happen go back.
+        // Nothing has been deleted at this point, so the caller keeps whatever it
+        // already had.
         await refundWrites(env, ipHash, WRITES_PER_REGISTRATION - 1, reservation.day)
         return json({ error: 'could not store the subscription' }, 503)
       }
+
+      // Safe now: the replacement exists.
+      for (const name of stale) await env.SUBS.delete(name)
 
       // The index was written above, before any of this. Deletions are reflected in
       // it here and from /unsubscribe: an earlier version left them to the rebuild,
