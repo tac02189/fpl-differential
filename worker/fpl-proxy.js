@@ -4,7 +4,73 @@
 //  2. Push-subscription store in Worker KV (binding: SUBS). Public subscribe/unsubscribe;
 //     reading the list and the cron state requires the SUBS_SECRET bearer token.
 
-const ALLOW = /^\/(bootstrap-static|fixtures|element-summary|event|entry|leagues-classic)(\/|$)/
+// Every FPL path this app actually calls, as an EXACT shape, with the query
+// parameters each one is allowed to carry.
+//
+// This used to be a prefix test and a verbatim pass-through of url.search, which
+// made the edge cache trivially bypassable from two directions at once: a unique
+// query string (?x=1, ?x=2, ...) or a unique path under an allowed prefix
+// (/bootstrap-static/anything) is a unique cache key, so every request became a
+// fresh origin fetch. The cache was decorative against anyone who did not want it.
+//
+// What that threatens is not a Cloudflare quota but fantasy.premierleague.com's
+// patience: unbounded traffic from one worker is how an egress IP gets rate
+// limited or blocked, and then the app stops working for everyone using it. (The
+// cron calls the FPL API directly, not through here, so it would survive.)
+// Digit counts are deliberately tighter than the format allows. FPL has about 11
+// million teams (8 digits), a thousand players (4) and 38 gameweeks (2), so these
+// keep two or more orders of magnitude of headroom while shrinking the space of
+// distinct cache keys an enumerator can walk. That REDUCES enumeration; it does
+// not close it, and no amount of digit-trimming would — see the note on the
+// handler below.
+const ROUTES = [
+  { re: /^\/bootstrap-static\/$/, params: [] },
+  { re: /^\/fixtures\/$/, params: ['event'] },
+  { re: /^\/element-summary\/\d{1,6}\/$/, params: [] },
+  { re: /^\/event\/\d{1,3}\/live\/$/, params: [] },
+  { re: /^\/entry\/\d{1,10}\/$/, params: [] },
+  { re: /^\/entry\/\d{1,10}\/history\/$/, params: [] },
+  { re: /^\/entry\/\d{1,10}\/event\/\d{1,3}\/picks\/$/, params: [] },
+  { re: /^\/leagues-classic\/\d{1,10}\/standings\/$/, params: ['page_standings', 'page_new_entries', 'phase'] },
+]
+
+// Values FPL assumes when the parameter is absent. Sending one explicitly asks for
+// exactly the same data as omitting it, so it is dropped rather than forwarded —
+// otherwise /standings/ and /standings/?page_standings=1 are two cache entries for
+// one response. `event` is NOT here: /fixtures/ without it means every fixture,
+// which is genuinely different data.
+const PARAM_DEFAULTS = { page_standings: 1, page_new_entries: 1, phase: 1 }
+
+// One canonical URL per distinct piece of data, or null when the request names no
+// route at all. Canonical means: exactly one trailing slash, only the parameters
+// the route declares, each a small integer with leading zeros stripped, always in
+// the route's own order. Two requests for the same data therefore produce the same
+// string no matter how they were dressed up, and so share one cache entry.
+function canonicalUpstream(url) {
+  // Leading zeros come off the PATH too, not just off query values. The first
+  // version normalised `?event=009` to `?event=9` and then forwarded the path
+  // verbatim, so /entry/0123/ and /entry/123/ stayed two cache keys for one team —
+  // ten spellings of a single id, and forty-eight of an entry-plus-gameweek pair.
+  // Half the hole this function exists to close was still open.
+  //
+  // Stripping BEFORE the route match rather than after matters twice over: the
+  // digit bounds then apply to the real number, so padding cannot be used to
+  // smuggle an id past them, and any amount of padding collapses onto the same
+  // canonical key instead of being rejected into a separate one.
+  const path = (url.pathname.endsWith('/') ? url.pathname : url.pathname + '/').replace(/\/0+(\d)/g, '/$1')
+  const route = ROUTES.find(r => r.re.test(path))
+  if (!route) return null
+  const pairs = []
+  for (const name of route.params) {
+    const v = url.searchParams.get(name)
+    if (v === null || !/^\d{1,5}$/.test(v)) continue
+    const n = Number(v)
+    if (PARAM_DEFAULTS[name] === n) continue
+    pairs.push(name + '=' + n)
+  }
+  const search = pairs.length ? '?' + pairs.join('&') : ''
+  return { path, search, url: 'https://fantasy.premierleague.com/api' + path + search }
+}
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -976,13 +1042,21 @@ export default {
     }
 
     if (req.method !== 'GET') return new Response('Method not allowed', { status: 405 })
-    if (!ALLOW.test(url.pathname)) return new Response('Not found', { status: 404 })
+    // Canonicalising closes ALIASING: many spellings of one request now share one
+    // cache entry. It does not close ENUMERATION — /entry/1/ through /entry/<10
+    // digits>/ are all legitimate distinct keys, and each is a real origin fetch.
+    // Nothing in a cache key can fix that; it is bounded only by the Workers free
+    // plan's own 100,000 requests a day. Throttling the proxy would bound it
+    // tighter, and is not done here because the app polls live scores every 25
+    // seconds and a rate low enough to matter would break it.
+    const target = canonicalUpstream(url)
+    if (!target) return new Response('Not found', { status: 404 })
 
-    // live-scoring endpoints get a much shorter cache so goals don't lag minutes behind
-    const isLive =
-      url.pathname.startsWith('/event/') || (url.pathname.startsWith('/fixtures') && url.searchParams.has('event'))
-    const upstream = `https://fantasy.premierleague.com/api${url.pathname}${url.search}`
-    const res = await fetch(upstream, {
+    // live-scoring endpoints get a much shorter cache so goals don't lag minutes
+    // behind. Decided from the CANONICAL path, so a request cannot dress itself up
+    // as live to get the shorter TTL and a cheaper cache miss.
+    const isLive = target.path.startsWith('/event/') || (target.path === '/fixtures/' && target.search !== '')
+    const res = await fetch(target.url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (compatible; fpl-differential personal app)',
         Accept: 'application/json',
