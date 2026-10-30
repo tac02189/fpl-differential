@@ -4,11 +4,25 @@
 // one re-registering X — each saw the other's record as stale and deleted it, leaving
 // the device with no registration at all while both calls returned 200.
 //
-// The guard re-reads the roster immediately before acting on that list and skips any
-// key present again. What this suite has to keep true is BOTH halves:
-//   - the guard holds, and
-//   - the guard is not vacuous: ordinary sweeps still retire records.
-// A guard that simply never deleted anything would pass the first half alone.
+// Two mechanisms answer that, and this suite exists to keep both honest.
+//
+// The guard re-reads the roster immediately before acting on the list and skips any key
+// present again. It narrows the window and cannot close it: KV has no compare-and-delete,
+// so nothing checked BEFORE a delete can bind a delete. The enumeration below found the
+// schedule that survived it.
+//
+// The claim closes that one. A registration takes an exclusive claim, in the Durable
+// Object, on its own key and on every key it is about to retire, and holds all of them
+// until it answers — so the request whose write the delete would have destroyed is
+// refused the key instead, and never writes. The guard stays, because a concurrent
+// REBUILD puts a candidate back in the roster without claiming anything.
+//
+// What this suite has to keep true, for both:
+//   - no schedule leaves the device with zero records, and
+//   - neither mechanism is vacuous: ordinary sweeps still retire records, and an
+//     ordinary registration is not refused because another one is in flight.
+// A guard that never deleted anything, or a claim that refused everything, would each
+// pass the first half alone.
 //
 // EVERY schedule here is driven by operation barriers, never by sleeping and hoping.
 // A barrier names the exact KV operation a request must stop at; the test then drives
@@ -272,7 +286,7 @@ console.log('--- the operations a registration issues, which every barrier below
 // microtask queue, and it moved — B issued six operations under one harness and four
 // under another that differed only in bookkeeping. Deriving the barrier names from a
 // race is the same bug this file exists to remove, one level up.
-const SEQ_A = ['A get sub:Y', 'A get idx', 'A put idx', 'A put sub:Y', 'A get idx #2', 'A delete sub:X']
+const SEQ_A = ['A get sub:Y', 'A get idx', 'A get sub:X', 'A put idx', 'A put sub:Y', 'A delete sub:X']
 const SEQ_B = ['B get sub:X', 'B get idx', 'B put idx', 'B put sub:X']
 const solo = async (who, ep) => {
   const ch = mkChoreo(['X', 'Y'])
@@ -300,18 +314,18 @@ console.log('--- stopping A at each of its operations in turn: the whole schedul
 // that, so both are pinned: the roster is what the occupancy caps are computed from,
 // and a rebuild is the only thing that reconciles it.
 const EXPECT_A = {
-  'A get sub:Y':    { records: 1, endpoints: 'Y', roster: 'Y',
-    why: 'B finishes before A reads anything; A then moves the install to Y' },
-  'A get idx':      { records: 1, endpoints: 'Y', roster: 'Y',
-    why: 'same, one read later — A still computes its sweep from a roster B has finished with' },
-  'A put idx':      { records: 1, endpoints: 'Y', roster: 'Y',
-    why: 'B read the roster before A rewrote it, so B swept nothing: the case that never was a race' },
-  'A put sub:Y':    { records: 2, endpoints: 'X,Y', roster: 'X',
-    why: 'A finds X back in the roster and skips. The duplicate the guard trades for — and Y is stored UNLISTED, so the store under-counts until a rebuild' },
-  'A get idx #2':   { records: 1, endpoints: 'X', roster: 'X',
-    why: 'THE CASE THE GUARD EXISTS FOR: without it A deletes the X that B just wrote' },
-  'A delete sub:X': { records: 0, endpoints: '', roster: 'X',
-    why: 'KNOWN LIMIT: the guard passed, then the delete outlived B. The roster still lists X, over-counting a store that is empty. See below' },
+  'A get sub:Y':    { records: 1, endpoints: 'Y', roster: 'Y', status: '200/200',
+    why: 'B finishes before A has claimed anything, and A then moves the install to Y' },
+  'A get idx':      { records: 1, endpoints: 'Y', roster: 'Y', status: '200/200',
+    why: 'same, one read later — A claims nothing until its occupancy checks have passed' },
+  'A get sub:X':    { records: 1, endpoints: 'Y', roster: 'Y', status: '200/503',
+    why: 'A is confirming from X’s own record that X is still its to retire — the check that replaced the roster re-read. It holds the claim by now, so B is refused' },
+  'A put idx':      { records: 1, endpoints: 'Y', roster: 'Y', status: '200/503',
+    why: 'the claim is taken before this, so B cannot write the endpoint A is about to delete and is told to retry' },
+  'A put sub:Y':    { records: 1, endpoints: 'Y', roster: 'Y', status: '200/503',
+    why: 'was 2 records with Y stored UNLISTED — the duplicate the old roster guard traded for' },
+  'A delete sub:X': { records: 1, endpoints: 'Y', roster: 'Y', status: '200/503',
+    why: 'THE ONE THE GUARD COULD NOT CLOSE: the delete still outlives B, and now it can only remove a record B was refused permission to write' },
 }
 // One line per schedule: what it did, and — only when it diverged — what was expected.
 // A barrier that was never reached is its own kind of divergence and has to say so,
@@ -326,8 +340,13 @@ const report = (point, r, e, width) => {
     wrong.push('EXPECTED ' + e.records + ' [' + (e.endpoints || '-') + ']')
   }
   if (r.roster !== e.roster) wrong.push('EXPECTED roster [' + (e.roster || '-') + ']')
+  // The status pair is now the column that discriminates: 200/503 says the second call
+  // was refused the key the first was holding, which is the whole mechanism. Asserting
+  // it inside report rather than beside it means a schedule cannot quietly change which
+  // of the two it was while the store still looks right.
+  if (r.status !== e.status) wrong.push('EXPECTED status ' + e.status)
   ok(!wrong.length, point.padEnd(width) + ' -> ' + r.records + ' record(s) [' +
-    (r.endpoints || '-') + '], roster [' + (r.roster || '-') + ']  ' +
+    (r.endpoints || '-') + '], roster [' + (r.roster || '-') + '], ' + r.status + '  ' +
     (wrong.length ? wrong.join('; ') + '  ' : '') + '— ' + e.why)
 }
 
@@ -339,58 +358,91 @@ const attempt = async (point, fn) => {
 }
 
 const lostAt = []
+const disagreed = []
 for (const point of SEQ_A) {
   const e = EXPECT_A[point]
   if (!e) { ok(false, 'no stated outcome for barrier ' + point); continue }
   const r = await attempt(point, () => drive(point, A, B))
   if (!r) continue
   if (r.records === 0) lostAt.push(point)
+  if (r.roster !== r.endpoints) disagreed.push(point)
   report(point, r, e, 15)
-  ok(r.status === '200/200', '  both calls returned 200  [' + r.status + ']')
 }
-ok(lostAt.join() === 'A delete sub:X',
-  'exactly one of the ' + SEQ_A.length + ' loses every record, and it is the stalled delete  [' +
-  (lostAt.join() || 'none') + ']')
+ok(!lostAt.length, 'none of the ' + SEQ_A.length + ' loses every record  [' +
+  (lostAt.join() || 'none does') + ']')
+// Before the claim, three of these six ended with a record the roster did not list or a
+// listing with no record behind it — the store under-counting until a rebuild, which is
+// the direction that admits past the occupancy cap. Pinned as an aggregate because it is
+// a property of the set, not of any one row.
+ok(!disagreed.length, 'and in every one the roster agrees with the store  [' +
+  (disagreed.join() || 'all agree') + ']')
 
-console.log('--- the one the guard closes, stated on its own ---')
-// Named separately because it is the suite's non-vacuity anchor, and because it has to
-// keep working when the guard does not exist. Stopping at EITHER the guard's roster
-// re-read or the delete means the barrier fires in both worlds: with the guard A stops
-// at the re-read and skips; without it there is no re-read, A stops at the delete, and
-// releasing it destroys the registration B just made.
-{
-  const r = await drive(['A get idx #2', 'A delete sub:X'], A, B)
-  ok(r.stoppedAt === 'A get idx #2',
-    'A stops at its roster re-read, which only exists because of the guard  [' + r.stoppedAt + ']')
-  ok(r.records >= 1, '  the device still has a registration after both calls  [' +
-    r.records + ' record(s)]')
-  ok(r.endpoints === 'X', '  and it is the one B wrote, not a ghost  [' + (r.endpoints || '-') + ']')
-  ok(r.xIsSeed === false, '  carrying B’s push keys, so it is B’s write and not the seed record' +
-    ' it replaced  [' + (r.xIsSeed === null ? 'nothing stored' : r.xIsSeed ? 'seed record' : 'B’s') + ']')
-  ok(r.replaced[0] === 0, '  A reports retiring nothing, because it retired nothing  [replaced=' +
-    r.replaced[0] + ']')
-  console.log('      (without the guard A stops at the delete instead and this reads 0 records:')
-  console.log('       both calls return 200 and every future alert goes nowhere)')
-}
-
-console.log('--- and the one it does NOT close, so nobody has to rediscover it ---')
-// A characterization test, deliberately: it PASSES while the defect exists and goes
-// red when someone fixes it. That is the intent — a fix should land with this block
-// rewritten rather than discovered later — but it does mean three checks here and in
-// the table above encode data loss as the expected outcome, so read this before
-// assuming a red one is a regression.
+console.log('--- the schedule that used to lose everything ---')
+// This was a characterization test until the key claim landed: it PASSED while the
+// defect existed, and the comment here said so, because a fix should arrive with this
+// block rewritten rather than be discovered later. This is that rewrite.
 //
-// (An earlier version of this comment had it exactly backwards, saying a green run
-// would be the good news. It is a red one.)
+// What it was: A cleared the guard against a roster B had not touched yet, B then swept
+// A's record, and A's delete arrived afterwards. Both calls returned 200 and the device
+// was left with no registration at all. No stall was needed — an ordinary interleaving
+// produced it, which is why a guard that looked closed on a timing harness was not.
 {
   const r = await drive('A delete sub:X', A, B)
-  ok(r.records === 0, 'a delete that outlives B still destroys both records  [' +
-    r.records + ' record(s)]')
-  ok(r.status === '200/200', '  and both calls report success  [' + r.status + ']')
-  console.log('      (A cleared its guard against a roster B had not touched yet, then B')
-  console.log('       swept A’s record and A’s delete landed afterwards. KV has no')
-  console.log('       compare-and-delete, so nothing checked BEFORE a delete can bind it.')
-  console.log('       Closing it needs a version on the record the delete is conditional on.)')
+  ok(r.records === 1, 'the device still has a registration  [' + r.records + ' record(s)]')
+  ok(r.endpoints === 'Y' && r.roster === 'Y',
+    '  one record, and the roster lists exactly it  [' + (r.endpoints || '-') + ' / ' +
+    (r.roster || '-') + ']')
+  ok(r.status === '200/503', '  B was refused rather than told it had succeeded  [' + r.status + ']')
+  ok(r.replaced[0] === 1, '  and A retired the record it had claimed  [replaced=' +
+    r.replaced[0] + ']')
+  console.log('      (A holds X as a retirement candidate from before its first write')
+  console.log('       until after its delete, so B cannot write the endpoint A is about to')
+  console.log('       remove. KV has no compare-and-delete and nothing checked BEFORE a')
+  console.log('       delete can bind it, so the claim keeps B out of the window instead')
+  console.log('       of trying to detect it from inside.)')
+}
+
+console.log('--- the key changed hands: the record decides, and the claim makes that bind ---')
+// Peer review found this one after the claim had closed the schedule above, and it is
+// the reason the ownership check reads the RECORD rather than the roster.
+//
+// A candidate list comes from a roster snapshot, and a snapshot is not authority: that
+// key can have changed hands since. It needs a yield point between the snapshot and the
+// claim, and there is one — a registration that finds the index stale and is REFUSED the
+// rebuild grant awaits that refusal and then carries on with the snapshot it read before
+// asking. Install J re-registering the very endpoint install I is retiring is the real
+// case: clearing a browser's storage mints a new installId while leaving its push
+// endpoint intact, so the record at one key legitimately changes install.
+//
+// Driven here at the confirming read rather than through that whole schedule, because
+// what is under test is the decision, not the route to it: the record at X is rewritten
+// to carry another install exactly as J's registration would leave it, while A holds the
+// claim and is about to act on a snapshot that says X is A's.
+{
+  const ch = mkChoreo(['X', 'Y'])
+  const I = randomUUID(), J = randomUUID()
+  await must(ch, 'X', I)
+  const h = ch.hold('A get sub:X')
+  const p = ch.as('A', () => post(ch, 'Y', I))
+  p.catch(() => {})
+  ok(await settle(h.what, h.reached, p.then(() => null, () => null)) === 'A get sub:X',
+    'A stops at the read that confirms X is still its own')
+  const rec = JSON.parse(ch.env.SUBS._m.get(keyOf('X')))
+  rec.installId = J                                   // as J's re-registration would leave it
+  ch.env.SUBS._m.set(keyOf('X'), JSON.stringify(rec))
+  h.release()
+
+  const body = await (await p).json()
+  ok(body.replaced === 0, '  and retires nothing  [replaced=' + body.replaced + ']')
+  ok(ch.env.SUBS._m.has(keyOf('X')), '  J’s record survives')
+  ok(endpointsIn(ch).join() === 'X,Y', '  one record per install  [' +
+    endpointsIn(ch).join() + ']')
+  console.log('      (the roster could not have answered this. A’s own index save drops X')
+  console.log('       from the roster moments later, so a roster read after the save sees')
+  console.log('       X absent and deletes it; a read BEFORE the save sees whatever the')
+  console.log('       roster happens to hold, which is a cache that can be absent, five')
+  console.log('       minutes stale, or lost to a concurrent save. The record is the only')
+  console.log('       authority, and it is readable here only because the key is claimed.)')
 }
 
 console.log('--- stopping B instead: the side that re-registers what it already has ---')
@@ -400,14 +452,14 @@ console.log('--- stopping B instead: the side that re-registers what it already 
 // how B's own guard and delete get exercised at all. The last two are where B had
 // already read the roster first, so it has nothing to retire and the store keeps both.
 const EXPECT_B = {
-  'B get sub:X': { records: 1, endpoints: 'X', roster: 'X',
-    why: 'B resumes into a roster holding only Y, sweeps it, and its own record is the survivor' },
-  'B get idx':   { records: 1, endpoints: 'X', roster: 'X',
-    why: 'same — B’s guard re-read and delete both run here' },
-  'B put idx':   { records: 2, endpoints: 'X,Y', roster: 'X',
-    why: 'B read the roster before A touched it, so it sweeps nothing and recreates the record A deleted. Y stored unlisted' },
-  'B put sub:X': { records: 2, endpoints: 'X,Y', roster: 'Y',
-    why: 'same, one write later — and here it is X that is stored unlisted' },
+  'B get sub:X': { records: 1, endpoints: 'X', roster: 'X', status: '200/200',
+    why: 'B had claimed nothing yet, so A sweeps X; B resumes into a roster holding only Y, sweeps it, and its own record is the survivor' },
+  'B get idx':   { records: 1, endpoints: 'X', roster: 'X', status: '200/200',
+    why: 'same — the claim is taken after the roster read, so stopping before it leaves A free to sweep. B’s guard re-read and delete both run here' },
+  'B put idx':   { records: 2, endpoints: 'X,Y', roster: 'X', status: '200/200',
+    why: 'B holds X by now, so A sweeps nothing instead of deleting a record B is about to rewrite. B’s own index save then drops Y, which is the unserialized roster and not this race' },
+  'B put sub:X': { records: 2, endpoints: 'X,Y', roster: 'X,Y', status: '200/200',
+    why: 'same, one write later — and here A finds X claimed, so it no longer reports X gone while the record stands' },
 }
 const bRecords = []
 for (const point of SEQ_B) {
@@ -417,21 +469,20 @@ for (const point of SEQ_B) {
   if (!r) continue
   bRecords.push(r.records)
   report(point, r, e, 13)
-  ok(r.status === '200/200', '  both calls returned 200  [' + r.status + ']')
 }
 ok(bRecords.length === SEQ_B.length && Math.min(...bRecords) >= 1,
   'no B-held schedule leaves the device with zero records  [' + bRecords.join(',') + ']')
 
 console.log('--- and B gets the same protection, in the only schedule where B can sweep ---')
-// B alone never sweeps, so until now its guard had only ever been watched DELETING —
-// the two schedules above where it acquires a stale list never put a candidate back
-// before its re-read. A guard that protected A's path and not B's would have passed
-// everything above. Two barriers in sequence put B in the protecting role: stop it
-// before it reads the roster, let A finish, re-arm on its guard, then hand the
-// candidate back.
+// B alone never sweeps, so without this its ownership check had only ever been watched
+// AGREEING — the two schedules above where it acquires a candidate list never changed
+// that record's owner first. A check that covered A's path and not B's would have passed
+// everything above. Two barriers in sequence put B in the refusing role: stop it before
+// it reads the roster, let A finish, re-arm on its confirming read, then hand the record
+// to another install.
 {
   const ch = mkChoreo(['X', 'Y'])
-  const I = randomUUID()
+  const I = randomUUID(), J = randomUUID()
   await must(ch, 'X', I)
   const h1 = ch.hold('B get idx')
   const b = ch.as('B', () => post(ch, 'X', I))
@@ -439,17 +490,95 @@ console.log('--- and B gets the same protection, in the only schedule where B ca
   ok(await settle(h1.what, h1.reached, b.then(() => null, () => null)) === 'B get idx',
     'B stops before reading the roster')
   await ch.as('A', () => post(ch, 'Y', I))     // A completes: store and roster hold Y
-  const h2 = ch.hold('B get idx #2')           // re-armed BEFORE the release, or B sails past
+  const h2 = ch.hold('B get sub:Y')            // re-armed BEFORE the release, or B sails past
   h1.release()
-  ok(await settle(h2.what, h2.reached, b.then(() => null, () => null)) === 'B get idx #2',
-    '  resumes, finds Y stale, and stops at its own guard')
-  restore(ch, keyOf('Y'))
+  ok(await settle(h2.what, h2.reached, b.then(() => null, () => null)) === 'B get sub:Y',
+    '  resumes, finds Y stale, and stops to confirm Y is its own')
+  const recY = JSON.parse(ch.env.SUBS._m.get(keyOf('Y')))
+  recY.installId = J
+  ch.env.SUBS._m.set(keyOf('Y'), JSON.stringify(recY))
   h2.release()
 
   const body = await (await b).json()
   ok(body.replaced === 0, '  and skips the delete  [replaced=' + body.replaced + ']')
-  ok(nSubs(ch.env) === 2, '  so A’s record survives  [' + nSubs(ch.env) + ' records]')
+  ok(nSubs(ch.env) === 2, '  so the record at Y survives  [' + nSubs(ch.env) + ' records]')
   ok(endpointsIn(ch).join() === 'X,Y', '  both endpoints stored  [' + endpointsIn(ch).join() + ']')
+}
+
+console.log('--- a candidate somebody else holds drops out of the sweep, and that is all ---')
+// The other half of the claim's contract, and the asymmetry is the whole design. Short
+// of the grant on its OWN key is a refusal, because a second writer behind the first is
+// exactly what the claim exists to prevent. Short of the grant on a CANDIDATE is not: a
+// record somebody else is holding is simply not this request's to retire, and failing
+// the registration over it would turn a transient overlap into a failed enable.
+//
+// All-or-nothing would have been the easier thing to write and it is the wrong thing:
+// one busy candidate would refuse a registration that had every right to proceed.
+{
+  const ch = mkChoreo(['X', 'Y'])
+  const I = randomUUID()
+  await must(ch, 'X', I)
+  // After B's claim, not before it — the claim is taken once the occupancy checks pass,
+  // so a barrier on B's roster read would leave B holding nothing at all.
+  const h = ch.hold('B put idx')
+  const b = ch.as('B', () => post(ch, 'X', I))
+  b.catch(() => {})
+  ok(await settle(h.what, h.reached, b.then(() => null, () => null)) === 'B put idx',
+    'B stops holding its own key, which is A’s only retirement candidate')
+
+  const a = await ch.as('A', () => post(ch, 'Y', I))
+  const body = await a.clone().json()
+  ok(a.status === 200, '  A still registers rather than being refused  [' + a.status + ']')
+  ok(body.replaced === 0, '  retiring nothing, because X was not its to retire  [replaced=' +
+    body.replaced + ']')
+  ok(ch.env.SUBS._m.has(keyOf('X')), '  the record at X is still there: A did not delete it')
+  ok(rosterIn(ch) === 'X,Y',
+    '  and the roster still lists X rather than reporting a record that is standing as gone  [' +
+    rosterIn(ch) + ']')
+  h.release()
+  await b
+  console.log('      (that last one is new: the sweep used to drop every candidate from the')
+  console.log('       roster before the guard ran, so a skipped delete left the store')
+  console.log('       under-counted — the direction that admits past the occupancy cap.)')
+}
+
+console.log('--- claims are per KEY, not per install ---')
+// Two requests contending for one endpoint need not share an installId. A browser whose
+// localStorage is cleared mints a new installId and re-registers the SAME push endpoint,
+// so the record at that key changes hands between installs — and a claim keyed on the
+// installId would not have excluded them.
+//
+// It also drives the one path the schedules above cannot reach: a request granted SOME
+// of what it asked for and then refused its own key. It has to hand back the candidates
+// it did get, or they stay locked until the lease expires and the next sweep skips them.
+{
+  const ch = mkChoreo(['x', 'w', 'y', 'w2'])
+  const I = randomUUID(), J = randomUUID()
+  await must(ch, 'w', J)      // a second install, with a record of its own
+  await must(ch, 'x', I)
+
+  const h = ch.hold('A put idx')
+  const a = ch.as('A', () => post(ch, 'y', I))      // install I moves x -> y, claiming both
+  a.catch(() => {})
+  ok(await settle(h.what, h.reached, a.then(() => null, () => null)) === 'A put idx',
+    'install I holds x as a retirement candidate')
+
+  // Install J now claims the endpoint I currently owns: a cleared-localStorage
+  // re-registration. Its own key is held, so it is refused — but w, its own stale
+  // record, was free and was granted to it before that was known.
+  const r = await ch.as('B', () => post(ch, 'x', J))
+  ok(r.status === 503, '  a DIFFERENT install is refused that endpoint too  [' + r.status + ']')
+  h.release()
+  await a
+
+  ok(nSubs(ch.env) === 2 && endpointsIn(ch).join() === 'w,y',
+    '  I keeps its move and J keeps its own record  [' + endpointsIn(ch).join() + ']')
+  const third = await (await post(ch, 'w2', J)).json()
+  ok(third.replaced === 1,
+    '  and J’s next registration can still retire w, so the refused request handed it back  [replaced=' +
+    third.replaced + ']')
+  ok(endpointsIn(ch).join() === 'w2,y', '  leaving one record per install  [' +
+    endpointsIn(ch).join() + ']')
 }
 
 console.log('--- but the sweep still works: an ordinary reinstall retires its old record ---')
@@ -479,72 +608,81 @@ console.log('--- SEVERAL stale records for one install are all retired ---')
   ok(endpointsIn(ch).join() === 'p3', '  and it is the new endpoint  [' + endpointsIn(ch).join() + ']')
 }
 
-console.log('--- a MIXED sweep: one candidate came back, one did not ---')
-// Every protected schedule above has exactly ONE stale candidate, and the test above
-// has several but none protected. Two broken guards survive that combination: one that
-// stops protecting as soon as there are several candidates, and one that abandons the
-// WHOLE sweep the moment any single candidate turns out to be live. They are wrong in
+console.log('--- a MIXED sweep: one candidate changed hands, one did not ---')
+// Every schedule above that refuses a retirement has exactly ONE candidate, and the test
+// above has several but refuses none. Two broken checks survive that combination: one
+// that stops checking as soon as there are several candidates, and one that abandons the
+// WHOLE sweep the moment any single candidate turns out not to be ours. They are wrong in
 // opposite directions — the first deletes a live record, the second keeps dead ones
-// forever — and only a sweep holding both kinds at once tells either from the real
-// thing. Raised by peer review; neither mutant failed anything before this block.
+// forever — and only a sweep holding both kinds at once tells either from the real thing.
+// Raised by peer review of the roster version of this check; neither mutant failed
+// anything before this block existed, and both still fail it now that the check reads the
+// record instead.
 {
   const ch = mkChoreo(['m1', 'm2', 'm3'])
-  const I = randomUUID()
+  const I = randomUUID(), J = randomUUID()
   await must(ch, 'm1', randomUUID())
   await must(ch, 'm2', randomUUID())
   plantUnder(ch, I)
   const live = keyOf('m1'), dead = keyOf('m2')
 
-  const h = ch.hold('A get idx #2')
+  // Stop at the FIRST candidate's confirming read, which happens before either delete,
+  // and hand m1 to another install while both are still being judged.
+  const h = ch.hold(['A get sub:m1', 'A get sub:m2'])
   const p = ch.as('A', () => post(ch, 'm3', I))
   p.catch(() => {})
-  ok(await settle(h.what, h.reached, p.then(() => null, () => null)) === 'A get idx #2',
-    'the registration stops at its guard with two candidates to judge')
-  restore(ch, live)
+  const at = await settle('a candidate confirming read', h.reached, p.then(() => null, () => null))
+  ok(at === 'A get sub:m1' || at === 'A get sub:m2',
+    'the registration stops to confirm the first of two candidates  [' + at + ']')
+  const recM1 = JSON.parse(ch.env.SUBS._m.get(live))
+  recM1.installId = J
+  ch.env.SUBS._m.set(live, JSON.stringify(recM1))
   h.release()
 
   const body = await (await p).json()
   ok(body.replaced === 1, '  exactly one is retired  [replaced=' + body.replaced + ']')
-  ok(ch.env.SUBS._m.has(live), '  the one that came back survives')
-  ok(!ch.env.SUBS._m.has(dead), '  the one still missing from the roster is deleted')
+  ok(ch.env.SUBS._m.has(live), '  the one that changed hands survives')
+  ok(!ch.env.SUBS._m.has(dead), '  the one still its own is deleted')
   ok(endpointsIn(ch).join() === 'm1,m3', '  leaving exactly those two  [' +
     endpointsIn(ch).join() + ']')
 }
 
 console.log('--- uncertainty must mean SKIP, not delete-everything ---')
-// readIndex repairs a malformed roster into an empty one, which the guard would read as
-// "nothing is live" and therefore licence to delete every stale key — most destructive
-// exactly when the roster is corrupt. liveEntries answers null instead, and it rejects
-// SEVEN distinct shapes; the first version of this file exercised one of them. Each
-// fault is aimed at the guard's own read by name, so it cannot drift onto another read
-// the way a "third get() wins" counter does.
+// Every shape a candidate record can be in that is not a plain "yes, still mine". The
+// check answers false to all of them, so the record is kept.
 //
-// A valid but EMPTY entry map is deliberately not in this list: it is not corrupt, it
-// says nothing is live, and deleting is then correct. It is also unreachable here,
-// because the request writes its own key into the roster before this read.
+// This table used to aim at the roster instead, and the two defects it was written for
+// were both about reading the roster wrongly: readIndex repairs a malformed roster into
+// an EMPTY one, which a presence check reads as "nothing is live" and therefore licence
+// to delete every candidate — most destructive exactly when the roster is corrupt — and
+// its KV get sits outside its own try, so a rejected read escaped AFTER the replacement
+// was stored and turned a registration that had worked into an error the client retries.
+// Reading the record instead of the roster retires the first of those: there is no
+// repair step to misread. The second is still a live hazard and is the last row here.
 //
-// The last row is the one the review found in the first version of the guard: readIndex
-// does its KV get outside its own try, so a rejected read escaped AFTER the replacement
-// was stored, turning a registration that had worked into an error the client retries.
-const UNREADABLE = [
-  ['missing',           () => null],
-  ['invalid JSON',      () => '{'],
-  ['JSON null',         () => 'null'],
-  ['not an object',     () => '"a bare string"'],
-  ['no entry map',      () => JSON.stringify({ t: Date.now() })],
-  ['entry map is array', () => JSON.stringify({ t: Date.now(), e: [] })],
-  ['entry map is string', () => JSON.stringify({ t: Date.now(), e: 'not-an-object' })],
-  ['the read THROWS',   () => { throw new Error('KV read failed') }],
+// A record that parses and belongs to ANOTHER install is not in this list — that is not
+// uncertainty, it is a clear no, and the two blocks above drive it.
+const UNCONFIRMABLE = [
+  ['missing',            () => null],
+  ['invalid JSON',       () => '{'],
+  ['JSON null',          () => 'null'],
+  ['not an object',      () => '"a bare string"'],
+  ['no installId',       () => JSON.stringify({ subscription: {}, teamId: 7 })],
+  ['installId is null',  () => JSON.stringify({ installId: null })],
+  ['installId is an object', () => JSON.stringify({ installId: {} })],
+  ['the read THROWS',    () => { throw new Error('KV read failed') }],
 ]
-for (const [what, fault] of UNREADABLE) {
+for (const [what, fault] of UNCONFIRMABLE) {
   const ch = mkChoreo(['c1', 'c2'])
   const I = randomUUID()
   await must(ch, 'c1', I)
-  ch.fault('A get idx #2', fault)
+  // Aimed at the confirming read by name, so it cannot drift onto another read the way
+  // a "third get() wins" counter does.
+  ch.fault('A get sub:c1', fault)
   const r = await ch.as('A', () => post(ch, 'c2', I))
   const body = await r.json()
   ok(r.status === 200 && body.replaced === 0 && nSubs(ch.env) === 2,
-    what.padEnd(19) + ' -> registered, retired nothing, old record kept  [' + r.status +
+    what.padEnd(23) + ' -> registered, retired nothing, old record kept  [' + r.status +
     ', replaced=' + body.replaced + ', ' + nSubs(ch.env) + ' records]')
 }
 console.log('      (the kept record is a duplicate: an extra push on every notification')
@@ -552,42 +690,18 @@ console.log('       until that endpoint starts returning 404/410 and the cron un
 console.log('       it. A healthy duplicate is not pruned on a timer. Still the better')
 console.log('       side of the trade — the alternative deletes a possibly-live record.)')
 
-console.log('--- a rebuild between the save and the re-read: leaks one, then self-heals ---')
-// The cost of the guard: if a rebuild re-lists KV in that window the stale key is back
-// in the roster, so the guard skips it. This pins that it leaks ONE and that the next
-// registration clears it, rather than accumulating. The rebuild is applied at the
-// barrier immediately before the guard's read, which is the only window where it bites.
-{
-  const ch = mkChoreo(['h1', 'h2', 'h3'])
-  const I = randomUUID()
-  await must(ch, 'h1', I)
-  const stale = subKeys(ch)[0]
-  const h = ch.hold('A get idx #2')
-  const p = ch.as('A', () => post(ch, 'h2', I))
-  p.catch(() => {})
-  ok(await settle(h.what, h.reached, p.then(() => null, () => null)) === 'A get idx #2',
-    'the registration stops at the guard’s roster re-read')
-  const i = JSON.parse(ch.env.SUBS._m.get(IDX))   // as a concurrent rebuild re-listing KV would
-  i.e[stale] = [I, null]
-  ch.env.SUBS._m.set(IDX, JSON.stringify(i))
-  h.release()
-  await p
-  ok(nSubs(ch.env) === 2, 'the skipped delete leaves one extra record  [' + nSubs(ch.env) + ']')
-  await must(ch, 'h3', I)
-  ok(nSubs(ch.env) === 1, '  and the next registration AT A NEW ENDPOINT clears it  [' +
-    nSubs(ch.env) + ']')
-  ok(endpointsIn(ch).join() === 'h3', '  leaving the newest endpoint  [' + endpointsIn(ch).join() + ']')
-  console.log('      (an IDENTICAL re-registration would not: it returns early without')
-  console.log('       sweeping at all, so "the next registration" has to be a new endpoint)')
-}
-
-console.log('--- repeated interference: it does NOT stay at one ---')
-// The block above shows recovery from ONE interference, which the first version of this
-// file wrote up as "bounded and self-healing — it does not accumulate". That was a
-// claim about every schedule drawn from a sample of one, and peer review called it.
-// So: interfere on every registration in a row and measure. Each iteration uses its
-// own label because the tag counter is per-store, and 'A get idx #2' in a loop would
-// name the second read of the FIRST iteration only.
+console.log('--- a concurrent rebuild no longer makes a registration leak its own record ---')
+// This block used to measure the OPPOSITE, and the change is the point of reading the
+// record rather than the roster. The old check asked whether the candidate was in the
+// roster again and skipped it if so. A rebuild re-lists KV and writes a roster naming
+// everything it finds, including the record about to be retired — so an ordinary rebuild
+// landing in that window made the registration skip its own delete and leak a duplicate.
+// Measured then at one per interfering registration (2,3,4,5 over four in a row), which
+// is why the comment in the worker calls the roster the wrong authority: a rebuild
+// re-listing a record is not evidence that anyone else wants it.
+//
+// Each iteration uses its own label because the tag counter is per store, so one fixed
+// barrier name in a loop would only ever match the first iteration.
 {
   const names = ['i0', 'i1', 'i2', 'i3', 'i4']
   const ch = mkChoreo([...names, 'i5'])
@@ -597,22 +711,182 @@ console.log('--- repeated interference: it does NOT stay at one ---')
   for (let n = 1; n < names.length; n++) {
     const who = 'A' + n
     const back = subKeys(ch)                       // everything stored comes back mid-flight
-    const h = ch.hold(who + ' get idx #2')
+    const h = ch.hold(who + ' get ' + ch.nameOf(back[0]).replace(/^/, 'sub:'))
     const p = ch.as(who, () => post(ch, names[n], I))
     p.catch(() => {})
     const at = await settle(h.what, h.reached, p.then(() => null, () => null))
-    if (at) restore(ch, ...back)
+    if (at) restore(ch, ...back)                   // as a rebuild re-listing KV would
     h.release()
     await p
     counts.push(nSubs(ch.env))
   }
-  ok(counts.join(',') === '2,3,4,5', 'sustained interference accumulates one per registration  [' +
+  ok(counts.join(',') === '1,1,1,1',
+    'four registrations in a row, each with a rebuild landing mid-sweep, leak nothing  [' +
     counts.join(',') + ']')
+  ok(endpointsIn(ch).join() === 'i4', '  one record, the newest endpoint  [' +
+    endpointsIn(ch).join() + ']')
   const after = await post(ch, 'i5', randomUUID())
-  ok(after.status === 200, '  the store still admits registrations  [' + after.status + ']')
-  console.log('      (so the leak is self-healing only against ISOLATED interference. The')
-  console.log('       bound is the occupancy cap, not the guard, and a rebuild reconciles')
-  console.log('       the roster within five minutes.)')
+  ok(after.status === 200, '  and the store still admits registrations  [' + after.status + ']')
+}
+
+console.log('--- MAX_SWEEP: a drifted store heals over registrations, not in one ---')
+// Each candidate costs a claim and a confirming read, and the read reservation had to
+// name a worst case before the request knew how many it would have. So the sweep is
+// capped, and the remainder has to be retired by the NEXT registration rather than
+// lingering — a cap that never caught up would be a leak with a bound on it.
+{
+  const ch = mkChoreo(['s0', 's1', 's2', 's3', 's4', 's5', 's6'])
+  const I = randomUUID()
+  for (let i = 0; i < 6; i++) await must(ch, 's' + i, randomUUID())
+  ok(plantUnder(ch, I).length === 6, 'six records planted on one install')
+
+  const first = await (await post(ch, 's6', I)).json()
+  ok(first.replaced === 4, '  one registration retires four  [replaced=' + first.replaced + ']')
+  ok(nSubs(ch.env) === 3, '  leaving the two it could not reach plus the new one  [' +
+    nSubs(ch.env) + ']')
+
+  // The leftovers are still this install's, so the next registration at a new endpoint
+  // takes them. (An identical re-registration would not: it returns early.)
+  const next = await (await post(ch, 's6', randomUUID())).json()
+  void next
+  const third = await (await post(ch, 's5', I)).json()
+  ok(third.replaced >= 1, '  and the next registration takes the rest  [replaced=' +
+    third.replaced + ']')
+  ok(nSubs(ch.env) <= 2, '  the store converges  [' + nSubs(ch.env) + ' records]')
+}
+
+console.log('--- the cap must credit what the install COULD retire, not what it will ---')
+// The lockout the second review found, and the reason the occupancy caps count the full
+// candidate list while the sweep is capped at MAX_SWEEP. Credit only what this request
+// attempts and a device holding more than MAX_SWEEP of its own records at either cap is
+// refused 429 — and refused again on every retry, because the only thing that could
+// reduce its count is the sweep the cap just blocked. It never registers again.
+//
+// Driven at the per-source cap, the smaller of the two and the one a single device can
+// reach. It only bites once the store is OVER that cap, which is a state this worker is
+// measured to reach: neither cap holds under concurrency (61 records against 50, and 20
+// from one source against 12). The caps are not exported, so the first one is discovered
+// here rather than restated — a copy of a constant is how the last one of these rotted.
+{
+  const ch = mkChoreo([])
+  const I = randomUUID()
+  let perIp = 0
+  while (perIp < 40) {
+    const rr = await post(ch, 'lk' + perIp, randomUUID())
+    if (rr.status !== 200) break
+    perIp++
+  }
+  ok(perIp > 0 && perIp < 40, 'the per-source cap refuses at ' + perIp + ' records')
+
+  // Plant past it, as a burst does: copy an existing record's source so the roster
+  // counts them against it, which is the whole point of the schedule.
+  const first = subKeys(ch)[0]
+  const over = []
+  for (let i = 0; i < 5; i++) {
+    const src = JSON.parse(ch.env.SUBS._m.get(first))
+    const meta = ch.env.SUBS._meta.get(first) || {}
+    const k = keyOf('ov' + i)
+    ch.env.SUBS._m.set(k, JSON.stringify({ ...src, subscription: { ...src.subscription, endpoint: EP('ov' + i) } }))
+    ch.env.SUBS._meta.set(k, { installId: null, ipHash: meta.ipHash ?? null })
+    const idx = idxOf(ch.env)
+    idx.e[k] = [null, meta.ipHash ?? null]
+    ch.env.SUBS._m.set(IDX, JSON.stringify(idx))
+    over.push(k)
+  }
+  const total = perIp + over.length
+  ok(plantUnder(ch, I).length === total,
+    '  ' + total + ' records, all one install and one source: over the cap by ' +
+    over.length)
+
+  let r = await post(ch, 'lknew', I)
+  ok(r.status === 200,
+    'the device can still move to a new endpoint rather than being locked out  [' +
+    r.status + ']')
+
+  // And it converges, rather than sitting one capped sweep short of the cap forever.
+  let rounds = 0
+  while (nSubs(ch.env) > 1 && rounds < 30) {
+    rounds++
+    r = await post(ch, 'lkr' + rounds, I)
+    if (r.status !== 200) break
+  }
+  ok(r.status === 200 && nSubs(ch.env) === 1,
+    '  and repeated replacements converge to one record  [' + nSubs(ch.env) +
+    ' after ' + rounds + ' more, last status ' + r.status + ']')
+}
+
+console.log('--- the residual: a stale KV read can still mislead the confirmation ---')
+// A characterization test. It PASSES while the defect exists and goes red when someone
+// fixes it, which is the same shape the schedule this whole change closed used to have.
+//
+// The claim stops another request from WRITING a held key. It cannot make a KV read
+// return the latest completed write — KV is eventually consistent, and /unsubscribe's
+// own comment has said so for as long as it has existed. So the confirming read can
+// return the record as it was BEFORE another install re-registered that endpoint, and
+// then the delete is wrong for exactly the reason the roster was wrong: the observation
+// was stale, and exclusion preserves an authoritative observation rather than creating
+// one. Second review called this, correctly, and it is the honest limit of the design.
+//
+// Closing it needs the ownership assertion to live where reads are strongly consistent —
+// the Durable Object, written under the key's own claim before the KV put, and returned
+// by the claim itself so it costs no extra round trip. That is deliberately NOT built
+// here: it is a second roster inside the object, and moving the roster in there is a
+// settled decision in this project. The record read is still strictly better than the
+// roster read it replaced, which could be absent, five minutes stale, or clobbered.
+{
+  const ch = mkChoreo(['X', 'Y'])
+  const I = randomUUID(), J = randomUUID()
+  await must(ch, 'X', I)
+  const fresh = JSON.parse(ch.env.SUBS._m.get(keyOf('X')))
+  const stale = JSON.stringify({ ...fresh, installId: I })
+  // X now really belongs to J, as a cleared-storage re-registration would leave it...
+  ch.env.SUBS._m.set(keyOf('X'), JSON.stringify({ ...fresh, installId: J }))
+  // ...but the confirming read is served the version from before that write.
+  ch.fault('A get sub:X', () => stale)
+
+  const r = await ch.as('A', () => post(ch, 'Y', I))
+  const body = await r.json()
+  ok(body.replaced === 1, 'a stale read makes the sweep retire a record it no longer owns  [replaced=' +
+    body.replaced + ']')
+  ok(!ch.env.SUBS._m.has(keyOf('X')), '  J’s record is gone, and J was told it succeeded')
+  console.log('      (red here is the good news: it means the ownership assertion moved')
+  console.log('       somewhere with read-after-write, and this block should be rewritten')
+  console.log('       the way the one above it was.)')
+}
+
+console.log('--- /unsubscribe deletes by name too, so it claims as well ---')
+// Found by peer review: the delete at the end of /unsubscribe was outside the exclusion
+// entirely. Suspend a prune just before its delete, let a registration claim that
+// endpoint and store a record there, and the prune removes a registration that had just
+// succeeded — and because that registration retires an older record of its own, the
+// device is left with neither. Both /unsubscribe paths claim now; this drives the
+// authenticated one, which is the cron's prune.
+{
+  const ch = mkChoreo(['u1', 'u2'])
+  const I = randomUUID()
+  await must(ch, 'u1', I)
+  const unsub = () => w.fetch(new Request('https://x/unsubscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + SECRET },
+    body: JSON.stringify({ endpoint: EP('u2') }),
+  }), ch.env)
+
+  // A registration for u2 is stopped while holding the claim on u2 and on u1.
+  const h = ch.hold('A put sub:u2')
+  const p = ch.as('A', () => post(ch, 'u2', I))
+  p.catch(() => {})
+  ok(await settle(h.what, h.reached, p.then(() => null, () => null)) === 'A put sub:u2',
+    'a registration is mid-flight holding the endpoint the cron wants to prune')
+  const r = await ch.as('U', () => unsub())
+  ok(r.status === 200, '  the prune still answers 200, because the cron does not retry bodies  [' +
+    r.status + ']')
+  ok(ch.log.filter(t => t.startsWith('U delete')).length === 0,
+    '  but it issued no delete  [' + (ch.log.filter(t => t.startsWith('U ')).join(', ') || 'no KV ops') + ']')
+  h.release()
+  await p
+  ok(nSubs(ch.env) === 1 && endpointsIn(ch).join() === 'u2',
+    '  so the registration that succeeded is the one that stands  [' +
+    endpointsIn(ch).join() + ']')
 }
 
 process.exit(fail ? 1 : 0)   // the exit handler above prints the tally, crash or not

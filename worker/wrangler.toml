@@ -19,6 +19,13 @@ simple = { limit = 5, period = 60 }
 # same number both pass while only one write survives. A Durable Object runs one
 # reservation at a time, so "is there room, and if so take it" is indivisible.
 #
+# It also owns the exclusive key claims /subscribe takes before it writes or deletes a
+# record, for the same reason in a different currency: KV has no compare-and-delete, so
+# a delete can only be made safe by seeing to it that no concurrent write to that key is
+# in flight. Those live in the object's MEMORY and not its storage — a claim means
+# nothing once its holder is gone — so they add two requests per registration and no
+# rows. No migration: same class, new routes.
+#
 # new_sqlite_classes, not new_classes: the Workers Free plan only offers the SQLite
 # storage backend, and key-value backed namespaces need a paid plan. The free
 # allowance is 100,000 Durable Object requests and 100,000 rows written a day, against

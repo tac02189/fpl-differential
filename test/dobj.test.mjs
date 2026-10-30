@@ -203,7 +203,11 @@ const READ_CAP = 50000, PER_SOURCE_READS = 600, R_UNSUB = 2
 // stale-delete guard added a roster re-read that only a SWEEPING request makes:
 // a registration with nothing to retire still reads 3. One name for both is what
 // broke this assertion when the reservation moved, so they are now two.
-const R_SUB_RESERVED = 4, R_SUB_NOSWEEP = 3
+// MAX_SWEEP moved them apart again: the sweep now confirms ownership from each
+// candidate RECORD rather than from one roster read, so the reservation covers the
+// worst case (3 + MAX_SWEEP) while a one-candidate sweep still spends 3.
+const MAX_SWEEP = 4
+const R_SUB_RESERVED = 3 + MAX_SWEEP, R_SUB_ONE = 3, R_SUB_ONE_REBUILD = 4
 ns = ns0()
 await call(ns, '/reserve', { source: 'a', n: 10, kind: 'r' })
 ok(rusedIn(ns) === 10 && usedIn(ns) === 0, 'reserving reads does not touch the write counter')
@@ -292,11 +296,9 @@ console.log('--- a sweeping registration must not read more than it reserved ---
       teamId: 7, installId: instA } ) }), eA)
   const sweepOnly = (eA.SUBS.ops.get - before.get) + (eA.SUBS.ops.list - before.list)
   ok((await rA.json()).replaced === 1, 'a sweeping registration retires one')
-  ok(sweepOnly === R_SUB_NOSWEEP, '  and reads ' + R_SUB_NOSWEEP +
-    '  [' + sweepOnly + ']')
+  ok(sweepOnly === R_SUB_ONE, '  and reads ' + R_SUB_ONE + '  [' + sweepOnly + ']')
 
-  // (b) sweeping AND rebuilding in one request: the worst case for a current-format
-  // store, and the only thing that justifies reserving 4 rather than 3.
+  // (b) sweeping AND rebuilding in one request.
   const eB = mkEnv(WriteBudget)
   const instB = randomUUID()
   await w.fetch(new Request('https://x/subscribe', { method: 'POST',
@@ -309,12 +311,44 @@ console.log('--- a sweeping registration must not read more than it reserved ---
     headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': IP },
     body: JSON.stringify({ subscription: { endpoint: EP('wc2'), keys: mkKeys() },
       teamId: 7, installId: instB } ) }), eB)
-  const worst = (eB.SUBS.ops.get - before.get) + (eB.SUBS.ops.list - before.list)
+  const oneRebuild = (eB.SUBS.ops.get - before.get) + (eB.SUBS.ops.list - before.list)
   ok((await rB.json()).replaced === 1, 'a registration that sweeps AND rebuilds retires one')
-  ok(worst === R_SUB_RESERVED, '  and reads exactly the ' + R_SUB_RESERVED +
+  ok(oneRebuild === R_SUB_ONE_REBUILD, '  and reads ' + R_SUB_ONE_REBUILD +
+    '  [' + oneRebuild + ']')
+  ok(oneRebuild > sweepOnly, '  i.e. the rebuild costs a read the plain sweep does not')
+
+  // (c) the worst case, which is what the reservation is sized against: a rebuild AND
+  // a full sweep. Nothing measured this when the reservation was 4 for a single roster
+  // re-read, so nothing confirmed the number covered anything — which is how a constant
+  // sized against another constant goes quietly wrong. MAX_SWEEP + 1 records are planted
+  // so the cap itself is exercised: the extra one must NOT be read.
+  const eC = mkEnv(WriteBudget)
+  const instC = randomUUID()
+  for (let i = 0; i <= MAX_SWEEP; i++) {
+    await w.fetch(new Request('https://x/subscribe', { method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': IP },
+      body: JSON.stringify({ subscription: { endpoint: EP('mx' + i), keys: mkKeys() },
+        teamId: 7, installId: randomUUID() } ) }), eC)
+  }
+  // Reassign every one of them to a single install, as a drifted store would hold them.
+  for (const k of [...eC.SUBS._m.keys()].filter(k => k.startsWith('sub:'))) {
+    const v = JSON.parse(eC.SUBS._m.get(k))
+    v.installId = instC
+    eC.SUBS._m.set(k, JSON.stringify(v))
+    eC.SUBS._meta.set(k, { installId: instC, ipHash: (eC.SUBS._meta.get(k) || {}).ipHash ?? null })
+  }
+  ageAll(eC)
+  before = { ...eC.SUBS.ops }
+  const rC = await w.fetch(new Request('https://x/subscribe', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': IP },
+    body: JSON.stringify({ subscription: { endpoint: EP('mxnew'), keys: mkKeys() },
+      teamId: 7, installId: instC } ) }), eC)
+  const worst = (eC.SUBS.ops.get - before.get) + (eC.SUBS.ops.list - before.list)
+  ok((await rC.json()).replaced === MAX_SWEEP,
+    'a full sweep retires MAX_SWEEP and no more  [' + MAX_SWEEP + ' expected]')
+  ok(worst === R_SUB_RESERVED, '  reading exactly the ' + R_SUB_RESERVED +
     ' it reserved  [' + worst + ']')
-  ok(worst > sweepOnly,
-    '  i.e. the reservation covers its own worst case, not just the common one')
+  ok(nSubs(eC) === 2, '  leaving the new record and the one over the cap  [' + nSubs(eC) + ']')
 }
 
 console.log('--- the one place the flat charge undercounts: an index rebuild ---')
@@ -331,8 +365,8 @@ const rebuildReads = async strip => {
 }
 const withMeta = await rebuildReads(false)
 const allLegacy = await rebuildReads(true)
-ok(withMeta === R_SUB_NOSWEEP,
-  'with metadata, a rebuild on a NON-sweeping registration reads ' + R_SUB_NOSWEEP +
+ok(withMeta === R_SUB_ONE,
+  'with metadata, a rebuild on a NON-sweeping registration reads ' + R_SUB_ONE +
   ' of the ' + R_SUB_RESERVED + ' reserved  [' + withMeta + ']')
 console.log('      (that is the earlier metadata work paying off: the sweep never')
 console.log('       fetches a value, so the common rebuild does not undercount at all)')
@@ -398,6 +432,115 @@ env.BUDGET._state._store.set('b', { day: today(), used: 0, src: {}, rused: 0, rs
 rr = await reg(w, env, 'none')
 ok(rr.status === 503, 'with NO roster and no grant, the request is told to retry')
 ok(nSubs(env) === 0, '  rather than building one off the books')
+
+console.log('--- exclusive key claims: what a stale delete cannot be made safe without ---')
+// A KV delete is issued by name and KV has no compare-and-delete, so /subscribe cannot
+// make the delete conditional on the record still being the one it decided to retire.
+// It claims the name instead, and holds it across its own writes and deletes. These are
+// the object-level properties the handler leans on; test/stale.test.mjs drives the
+// schedules that need them.
+// The token is the CALLER's. The object used to mint it from a counter, which review
+// killed twice over: a counter restarts at zero when the object loses its memory, so a
+// token from before that matches a grant from after it and frees somebody else's claim;
+// and a caller whose /claim response is lost holds claims it cannot name.
+const tok = () => randomUUID()
+{
+  const cl = ns0()
+  const T1 = tok(), T2 = tok()
+  const first = await (await call(cl, '/claim', { names: ['sub:a', 'sub:b'], id: T1 })).json()
+  ok(first.ok === true && first.names.join() === 'sub:a,sub:b',
+    'two free names are granted  [' + (first.names.join() || 'nothing') + ']')
+  ok(first.until > Date.now() + 10000, '  with a lease of at least ten seconds  [' +
+    (first.until - Date.now()) + 'ms]')
+
+  const second = await (await call(cl, '/claim', { names: ['sub:b', 'sub:c'], id: T2 })).json()
+  ok(second.names.join() === 'sub:c',
+    'a second caller gets what is free and not what is held  [' +
+    (second.names.join() || 'nothing') + ']')
+
+  const wrong = await (await call(cl, '/release', { names: ['sub:a'], id: T2 })).json()
+  ok(wrong.freed === 0, 'releasing a name under the WRONG token frees nothing  [freed=' +
+    wrong.freed + ']')
+  ok((await (await call(cl, '/claim', { names: ['sub:a'], id: tok() })).json()).names.length === 0,
+    '  so it is still held')
+
+  const freed = await (await call(cl, '/release', { names: ['sub:a', 'sub:b'], id: T1 })).json()
+  ok(freed.freed === 2, 'releasing under the right token frees both  [freed=' + freed.freed + ']')
+  ok((await (await call(cl, '/claim', { names: ['sub:a', 'sub:b'], id: tok() })).json()).names.length === 2,
+    '  and they can be claimed again')
+
+  // The reason the token cannot be the object's own counter. A fresh instance is the
+  // object having lost its memory; its first grant would be id 1 again, and a release
+  // left over from before would match it.
+  const reborn = ns0()
+  const T3 = tok()
+  ok((await (await call(reborn, '/claim', { names: ['sub:a'], id: T3 })).json()).names.join() === 'sub:a',
+    'after the object loses its memory the name is free, which is the expiry by another route')
+  ok((await (await call(reborn, '/release', { names: ['sub:a'], id: T1 })).json()).freed === 0,
+    '  and a token from BEFORE that cannot free the new holder’s claim  [freed=0 expected]')
+}
+{
+  // The expiry exists for a request that dies between claiming and releasing — without
+  // it that endpoint would be locked out until the object was evicted. Driven off the
+  // `until` the grant reports rather than a second copy of the constant, so the boundary
+  // is pinned and cannot drift from the value the object is actually using.
+  const cl = ns0()
+  const T = tok()
+  const g = await (await call(cl, '/claim', { names: ['sub:x'], id: T })).json()
+  const realNow = Date.now
+  try {
+    Date.now = () => g.until - 1
+    ok((await (await call(cl, '/claim', { names: ['sub:x'], id: tok() })).json()).names.length === 0,
+      'one millisecond before the lease expires the name is still held')
+    Date.now = () => g.until + 1
+    const after = await (await call(cl, '/claim', { names: ['sub:x'], id: tok() })).json()
+    ok(after.names.join() === 'sub:x', '  one millisecond after it, the name is free  [' +
+      (after.names.join() || 'nothing') + ']')
+    ok((await (await call(cl, '/release', { names: ['sub:x'], id: T })).json()).freed === 0,
+      '  and the lapsed holder cannot free what was reissued  [freed=0 expected]')
+  } finally { Date.now = realNow }
+}
+{
+  // Both ceilings, discovered rather than restated. Being full has to REFUSE, because
+  // the alternative is a delete with no exclusion behind it.
+  const cl = ns0()
+  const wide = await (await call(cl, '/claim',
+    { names: Array.from({ length: 200 }, (_, k) => 'sub:w' + k), id: tok() })).json()
+  ok(wide.names.length === 128, 'one call claims at most 128 names  [' + wide.names.length + ']')
+
+  const cl2 = ns0()
+  let held = 0
+  for (let i = 0; i < 8; i++) {
+    const names = Array.from({ length: 128 }, (_, k) => 'sub:' + i + '-' + k)
+    const g = await (await call(cl2, '/claim', { names, id: tok() })).json()
+    held += g.names.length
+    if (g.names.length < names.length) break
+  }
+  ok(held === 512, 'and the object holds at most 512 at once  [' + held + ']')
+  ok((await (await call(cl2, '/claim', { names: ['sub:one-more'], id: tok() })).json()).names.length === 0,
+    '  a full map grants nothing rather than over-filling')
+}
+{
+  const cl = ns0()
+  for (const [what, body] of [
+    ['no names', { names: [], id: tok() }],
+    ['names that are not an array', { names: 'sub:a', id: tok() }],
+    ['no token', { names: ['sub:a'] }],
+    ['a token that is not a string', { names: ['sub:a'], id: 7 }],
+    ['nothing at all', null],
+  ]) ok((await call(cl, '/claim', body)).status === 400, '/claim with ' + what + ' is rejected')
+  const T = tok()
+  await call(cl, '/claim', { names: ['sub:z'], id: T })
+  ok((await call(cl, '/release', { names: ['sub:z'] })).status === 400,
+    '/release with no token is rejected rather than read as a wildcard')
+  ok((await (await call(cl, '/claim', { names: ['sub:z'], id: tok() })).json()).names.length === 0,
+    '  so the claim survives it')
+  // The reservation paths require an `n` and 400 without one. Claims are named rather
+  // than counted, so they have to route AHEAD of that check or every one would be
+  // rejected over a field it has no use for.
+  ok((await call(cl, '/claim', { names: ['sub:q'], id: tok() })).status === 200,
+    'a claim needs no `n`, which every reservation does')
+}
 
 console.log('--- the list arithmetic, which is the quota this protects ---')
 const CRON_LISTS = 48

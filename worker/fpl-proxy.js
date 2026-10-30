@@ -351,8 +351,10 @@ const WRITES_PER_REGISTRATION = 3
 // read quota stops notifications outright.
 //
 // 60,000 leaves 40,000 for the cron, which needs about 1,500 (a list plus a get per
-// record, 48 runs a day). 600 per source is 150 registrations or 300 unsubscribes
-// in a day, against the two or three a real device performs.
+// record, 48 runs a day). 600 per source is 85 registrations or 300 unsubscribes in a
+// day, against the two or three a real device performs. (It was 150 while a
+// registration reserved 4; confirming each retirement from its own record took the
+// reservation to 3 + MAX_SWEEP, and over-reserving only ever refuses.)
 //
 // The reservation is taken BEFORE any KV read, which gives the property that
 // matters: when the object itself runs out — its own free allowance is 100,000
@@ -361,12 +363,18 @@ const WRITES_PER_REGISTRATION = 3
 // fine', never the reverse.
 const DAILY_READ_BUDGET = 50000
 const PER_SOURCE_READ_BUDGET = 600
-// Four, not three: the stale-delete guard re-reads the roster before acting on a
-// delete list computed earlier. Charged on every registration rather than only the
-// ones that sweep, because the reservation is taken before the request knows
-// whether it has anything to retire — over-reserving refuses, under-reserving
-// spends quota it was never charged for, and only the first of those is safe.
-const READS_PER_SUBSCRIBE = 4
+// How many prior records one registration will retire. Each one costs a KV read to
+// confirm it is still that install's own (retirableBy), and the read reservation is
+// taken before the request knows how many it has, so the worst case has to be a number.
+// A healthy device has at most one stale endpoint; more than that is a store that has
+// drifted, and it heals over consecutive registrations instead of in a single one.
+const MAX_SWEEP = 4
+// Three for the request itself — the existing record, the roster, and a rebuild's list —
+// plus one per record it may retire. Charged on every registration rather than only the
+// ones that sweep, because the reservation is taken before the request knows whether it
+// has anything to retire: over-reserving refuses, under-reserving spends quota it was
+// never charged for, and only the first of those is safe.
+const READS_PER_SUBSCRIBE = 3 + MAX_SWEEP
 const READS_PER_UNSUBSCRIBE = 2
 // The most any one reservation can ask for, whichever currency. A counter can
 // legitimately overshoot its ceiling by exactly this much, when the last grant
@@ -414,35 +422,57 @@ function clampSpend(v, ceiling) {
 
 // Entries are [installId, ipHash]. A tuple rather than an object because 20 of them
 // share one value and KV caps a value well above that, but short keys cost nothing.
-// What the guard in /subscribe reads, and deliberately NOT readIndex.
+// Whether the record at `name` is still this install's to retire — asked of the RECORD,
+// and deliberately not of the roster.
 //
-// readIndex repairs a malformed roster into an empty one so the staleness check
-// fires and a rebuild happens. That is right for admission and exactly wrong for
-// deciding what to delete: an empty roster lists nothing, so every stale name would
-// look safe to remove — the guard would be most destructive precisely when the
-// roster is corrupt. It also catches the KV read itself, which readIndex does not:
-// its get sits outside its own try, so a rejected read would escape AFTER the
-// replacement was stored, turning a registration that succeeded into an error the
-// client then retries.
+// The roster cannot answer it. It is a cache: absent on a fresh store, up to five
+// minutes stale, and losable to a concurrent registration's read-modify-write, and all
+// three of those answer this question wrongly. An earlier version of this check read the
+// roster and asked only whether the name was PRESENT again, which a concurrent rebuild
+// satisfies by re-listing KV — so an ordinary rebuild made a registration skip retiring
+// its own old record and leak it, measurably one per interfering registration.
 //
-// Returns the entry map, or null meaning "could not establish what is live" — a
-// different answer from "nothing is live", and the only one that makes skipping the
-// deletes the conservative choice it is meant to be.
-async function liveEntries(env) {
+// Reading the record is only worth anything because /subscribe takes an exclusive claim
+// on the key FIRST. No cooperating writer can touch a key this request holds, so nothing
+// INVALIDATES this answer between here and the delete several operations later. KV has
+// no compare-and-delete and no check before a delete can bind it — unless the key is
+// held, and then it can. This is the "identity on the record that the delete can be made
+// conditional on" the old comment at the delete site asked for; the claim is the part
+// that was missing, not the identity.
+//
+// It does NOT make the answer correct, and the difference is the honest limit of this
+// design. The claim stops later writes; it cannot make an eventually consistent read
+// return the last completed one. So this get can be served the record as it stood BEFORE
+// another install re-registered that endpoint, and the delete that follows is then wrong
+// for exactly the reason the roster was wrong — a stale observation. Exclusion preserves
+// an authoritative observation rather than creating one. Second peer review of this
+// change raised it; the residual block in test/stale.test.mjs pins it, and the named fix
+// is to put the ownership assertion where reads are strongly consistent: in the Durable
+// Object, written under the key's own claim before the KV put and handed back by the
+// claim itself, so it costs no extra round trip. Deliberately not built — that is a
+// second roster inside the object, and moving the roster there is settled in this
+// project — and the record is still strictly less wrong than the roster, which can be
+// absent, five minutes stale, or clobbered by a concurrent save.
+//
+// False for anything it cannot establish: no installId to match, a missing record
+// (nothing to retire anyway), an unreadable one, a read that throws. Skipping costs a
+// retained duplicate, which draws an extra push on every notification until that
+// endpoint 404s and the cron prunes it. Deleting wrongly costs that device every future
+// alert, silently and permanently. The asymmetry is the whole design.
+async function retirableBy(env, name, installId) {
+  if (!installId) return false
   let raw
   try {
-    raw = await env.SUBS.get(INDEX_KEY)
+    raw = await env.SUBS.get(name)
   } catch {
-    return null
+    return false
   }
-  if (!raw) return null
+  if (!raw) return false
   try {
-    const i = JSON.parse(raw)
-    if (!i || typeof i !== 'object') return null
-    if (!i.e || typeof i.e !== 'object' || Array.isArray(i.e)) return null
-    return i.e
+    const rec = JSON.parse(raw)
+    return !!rec && typeof rec === 'object' && rec.installId === installId
   } catch {
-    return null
+    return false
   }
 }
 
@@ -542,14 +572,116 @@ async function dropFromIndex(env, name) {
 // gets 100,000 requests and 100,000 rows written a day, against the 1000 KV writes
 // this is protecting — two orders of magnitude of headroom to account for something
 // there is very little of.
+// --- exclusive key claims -----------------------------------------------------
+// What makes the delete in /subscribe conditional. The other half is retirableBy.
+//
+// A KV delete is issued by name. By the time it lands, that name can hold a record a
+// DIFFERENT request has just written, and KV has no compare-and-delete — so nothing
+// checked before the delete can bind it. A roster re-read immediately before the
+// deletes used to stand here instead and narrowed the window without closing it:
+// test/stale.test.mjs enumerated the six points at which a registration can be
+// suspended and found one where everything was lost anyway. The request cleared that
+// check against a roster the other one had not touched yet, the other one swept its
+// record, and the first one's delete arrived afterwards. No stall was needed, which is
+// why it survived a check that looked closed on a timing-based harness.
+//
+// The comment at that delete said closing it needed "a version or identity on the
+// record that the delete can be made conditional on". Right prescription, and not
+// implementable as written: KV offers no conditional delete, and a Durable Object
+// cannot make a KV delete atomic with respect to another request's KV put of the same
+// key. The missing piece was never the identity. It was that a check before a delete
+// cannot bind that delete — unless the key is held. What a Durable Object CAN do is
+// see to it that no one else is in flight on that key at all.
+//
+// So a registration takes an exclusive claim on every key it may write or delete and
+// holds it until it answers, and only then asks the RECORD whether it is still this
+// install's to retire. A request that cannot have a key either retries (its own) or
+// leaves that record alone (a sweep candidate), so the write the other one's delete
+// would have destroyed is never issued; and because the key is held, the ownership
+// answer is still true when the delete runs. Exclusion is what makes the condition
+// bind, and the condition is what makes exclusion worth having — neither half is
+// sufficient, and the mutants for each reopen the loss on its own.
+//
+// Per KEY, not per installId: the two requests contending for a name need not share
+// one. A browser whose localStorage was cleared mints a new installId and
+// re-registers the SAME push endpoint, so the record at that key changes hands
+// between installs.
+//
+// THE INVARIANT, which is what makes this auditable rather than a pile of special cases:
+// every put and every delete of a sub: record in this file holds a claim on that key
+// first — the registration's own write and its sweep, and the delete at the end of each
+// /unsubscribe path, which peer review found outside the protocol altogether. The roster
+// key is deliberately NOT in it: its read-modify-write has never been serialized and
+// making it so is settled as not worth doing (see the cap-check block in /subscribe).
+// A lost roster update costs a wrong count and a rebuild to repair it; a lost record
+// costs a device every future notification. Only one of those is worth a lock.
+//
+// What remains open, and it is a different shape from what it replaces: a claim that
+// LAPSES while its holder is still running. Reaching the loss then needs a request
+// stalled past the expiry and still able to issue its delete, where before it needed
+// only an ordinary interleaving.
+//
+// Held across KV I/O, so it has to expire: a request that dies between claiming and
+// releasing would otherwise lock that endpoint out until the object is evicted. The span
+// it covers is one roster read, one confirming read and one delete per retirement, two
+// writes, and the reservation round-trip — up to a dozen operations at MAX_SWEEP, not the
+// four this said while the sweep was a single roster re-read.
+//
+// Fifteen seconds is a judgement, not a measurement: no latency figures for this worker
+// under load exist, and nothing here checks the lease before acting on it, so a request
+// slower than this proceeds as though it still held what it asked for. That is the
+// residual the section above names. Short enough that a client told to retry can.
+const CLAIM_MS = 15000
+// Per call, and in total. /subscribe asks for its own key plus at most MAX_SWEEP
+// candidates and /unsubscribe for one, so the per-call figure is not sized against
+// either — it is an input bound on this object's own surface, so a malformed or hostile
+// body cannot make it allocate. The total is a memory bound on a map otherwise bounded
+// only by the request rate; being full refuses a registration, which is the safe
+// direction, because the alternative is a delete with no exclusion behind it.
+const MAX_CLAIM_NAMES = 128
+const MAX_CLAIMS = 512
+
 export class WriteBudget {
   constructor(state) {
     this.state = state
+    // In memory, deliberately, and not in storage. Not because a persisted claim would
+    // leak — it carries an expiry, so it would be collected like any other; peer review
+    // was right that the earlier wording here claimed that and it does not follow. The
+    // reasons are that a claim is meaningful only while the request holding it is still
+    // running, so durability buys nothing it would ever read back, and that persisting
+    // would spend two storage rows per registration against the object's daily row
+    // allowance for state with a fifteen-second lifetime.
+    //
+    // What it costs: losing the map is equivalent to every claim expiring at once, so an
+    // eviction with requests in flight reopens the window for those requests. That is
+    // the same residual as the expiry itself, and it is named in the claim section above.
+    this.claims = new Map()
   }
 
   async fetch(req) {
     const url = new URL(req.url)
     const body = await req.json().catch(() => null)
+    // Claims are named rather than counted, so they route ahead of the `n` that every
+    // reservation needs and would fail validation on.
+    if (url.pathname === '/claim' || url.pathname === '/release') {
+      const names = Array.isArray(body?.names)
+        ? body.names.filter(x => typeof x === 'string' && x.length > 0 && x.length <= 80)
+          .slice(0, MAX_CLAIM_NAMES)
+        : []
+      // The token is the CALLER's, not this object's. Two reasons, both from review.
+      // A counter here restarts at zero when the object loses its memory, so a token
+      // issued before that can match a grant issued after it and release somebody
+      // else's claim. And a caller whose /claim response is lost holds claims it cannot
+      // name — with its own token it can still release every name it asked for, since a
+      // release only frees what matches.
+      const id = typeof body?.id === 'string' && body.id.length > 0 && body.id.length <= 64
+        ? body.id : null
+      if (!names.length || !id) {
+        return Response.json({ ok: false, reason: 'bad request' }, { status: 400 })
+      }
+      return this.guard(() =>
+        url.pathname === '/claim' ? this.claim(names, id) : this.release(names, id))
+    }
     const n = Number.isInteger(body?.n) && body.n > 0 && body.n <= 100 ? body.n : null
     if (!n) return Response.json({ ok: false, reason: 'bad request' }, { status: 400 })
     const source = typeof body.source === 'string' && body.source.length <= 64 ? body.source : null
@@ -654,6 +786,43 @@ export class WriteBudget {
     return Response.json({ ok: true, day: b.day })
   }
 
+  // Grants what is free and says which. A PARTIAL answer is the useful one: a sweep
+  // candidate somebody else holds is not this caller's to retire, while the caller
+  // reading the same answer for its own key treats anything short of the full list as
+  // a refusal. Returning all-or-nothing instead would make one busy candidate refuse a
+  // registration that had every right to proceed without it.
+  //
+  // Expired claims are reaped here rather than on a timer. Nothing else needs them
+  // gone, and an alarm to collect a map that empties itself would be a second mechanism
+  // for the same job.
+  claim(names, id) {
+    const now = Date.now()
+    for (const [name, c] of this.claims) if (c.until <= now) this.claims.delete(name)
+    const until = now + CLAIM_MS
+    const granted = []
+    for (const name of names) {
+      if (this.claims.has(name)) continue
+      if (this.claims.size >= MAX_CLAIMS) break
+      this.claims.set(name, { until, id })
+      granted.push(name)
+    }
+    // `until` goes back so a caller can see the lease it is holding, and so the suite
+    // can pin the expiry boundary instead of hardcoding a copy of CLAIM_MS.
+    return Response.json({ ok: true, names: granted, until })
+  }
+
+  // Only ever drops a claim this grant still holds. A lease that lapsed may already
+  // have been reissued, and releasing it by name alone would free somebody else's — the
+  // one way a late release could reopen exactly the race the claim closes.
+  release(names, id) {
+    let freed = 0
+    for (const name of names) {
+      const c = this.claims.get(name)
+      if (c && c.id === id) { this.claims.delete(name); freed++ }
+    }
+    return Response.json({ ok: true, freed })
+  }
+
   // Rolls over on the UTC date, where the KV quota resets. A value this code could
   // have written is real spend and is kept exactly; one it could not is corruption
   // and is discarded, rather than being read as "already spent" and refusing every
@@ -751,6 +920,53 @@ async function refundWrites(env, ipHash, n, day) {
     })
   } catch {
     /* over-counted until midnight, which only ever refuses */
+  }
+}
+
+// { names, asked, id } — what this request now holds exclusively, what it tried for, and
+// the token that releases either. See the claim section above WriteBudget.
+//
+// `asked` is what release uses, not `names`. A /claim whose response is lost or cannot
+// be decoded may have installed every one of them, and the caller cannot know which; a
+// release names them all and frees whichever actually matches its token. Releasing a
+// name that was never granted is a no-op, so the superset costs nothing and the subset
+// would leak.
+//
+// Unreachable or unbound grants NOTHING, which refuses the registration rather than
+// letting it proceed with no exclusion behind its delete. Same direction as the
+// reservations above and for a comparable reason: an unmetered write takes the cron
+// down, and an unexcluded delete erases a device's registration silently.
+async function claimKeys(env, names) {
+  const id = crypto.randomUUID()
+  const none = { names: [], asked: names, id }
+  if (!env.BUDGET || !names.length) return none
+  try {
+    const stub = env.BUDGET.get(env.BUDGET.idFromName('writes'))
+    const res = await stub.fetch('https://budget.invalid/claim', {
+      method: 'POST',
+      body: JSON.stringify({ names, id }),
+    })
+    if (!res.ok) return none
+    const j = await res.json()
+    if (!j?.ok || !Array.isArray(j.names)) return none
+    return { names: j.names, asked: names, id }
+  } catch {
+    return none
+  }
+}
+
+// Best effort. An unreleased claim expires on its own, so a failure here costs the
+// endpoints in this grant — however many that is — being told to retry until it does.
+async function releaseKeys(env, grant) {
+  if (!env.BUDGET || !grant?.id || !grant.asked?.length) return
+  try {
+    const stub = env.BUDGET.get(env.BUDGET.idFromName('writes'))
+    await stub.fetch('https://budget.invalid/release', {
+      method: 'POST',
+      body: JSON.stringify({ names: grant.asked, id: grant.id }),
+    })
+  } catch {
+    /* expires on its own */
   }
 }
 
@@ -867,228 +1083,338 @@ export default {
       // the cap. So: exactly one saveIndex per request, on whichever path exits.
 
       const names = Object.keys(idx.e)
-      const stale = []
+      const candidates = []
       let sameSource = 0
-      let sameSourceStale = 0
+      let sameSourceCandidates = 0
       for (const name of names) {
         if (name === key) continue
         const [eInstallId, eIpHash] = idx.e[name] || []
         const isStale = !!installId && eInstallId === installId
-        if (isStale) stale.push(name)
+        if (isStale) candidates.push(name)
         if (ipHash && eIpHash === ipHash) {
           sameSource++
-          if (isStale) sameSourceStale++
+          if (isStale) sameSourceCandidates++
         }
       }
+      // Each retirement costs a claim and a confirming read below, and the read
+      // reservation had to name a worst case before any of this was known. Which ones
+      // survive the cut does not matter — every candidate is a record this same install
+      // placed — so the roster's own key order is as good as any.
+      let stale = candidates.slice(0, MAX_SWEEP)
+      // The OCCUPANCY CAPS BELOW CREDIT `candidates`, NOT `stale`, and the difference is
+      // a lockout. Peer review found it: a device holding more than MAX_SWEEP of its own
+      // records at either cap would be credited only MAX_SWEEP of them, refused 429, and
+      // refused again on every retry — because the one thing that could reduce its count
+      // is the sweep this cap just blocked. The device can never register again.
+      //
+      // Crediting the full list restores what the caps did before the cap on the sweep
+      // existed, and it reinstates an over-credit an earlier review of THIS change
+      // objected to: a credited retirement that then does not happen admits one past the
+      // cap. Both reviewers are right and they pull opposite ways, so this picks the
+      // direction on consequence. Over-crediting admits records into a store that the
+      // very next registration shrinks again, and the caps are already measured not to
+      // hold under concurrency. Under-crediting silently and permanently ends
+      // notifications for a device that has done nothing wrong. Only one of those is
+      // recoverable, and it is not the second.
 
-      // Records this install is about to retire do not count against its own source, so
-      // re-registering a device never blocks itself. Skipped when the record already
-      // exists: updating a registration in place adds nothing to the store.
-      // An UPDATE reassigns the record's ipHash to whoever sent it, and the check
-      // below used to run only for new records — so a caller could create records
-      // from many sources, then update each one from a single source and move the
-      // whole lot into that source's allocation without it ever being counted.
-      // Only its own endpoints are needed. A transfer into a source is an addition
-      // to that source, so it is checked like one.
-      const prevIpHash = existing ? (idx.e[key] || [])[1] ?? null : null
-      const movingSource = !!existing && !!ipHash && prevIpHash !== ipHash
-      if ((!existing || movingSource) && ipHash && sameSource - sameSourceStale >= MAX_PER_IP) {
+      // Nothing from here to the response may run concurrently for the SAME KEY.
+      //
+      // The delete below is issued by name, and by the time it lands that name can hold
+      // a record another request has just written. KV has no compare-and-delete, so no
+      // check made before the delete can bind it — the claim section above WriteBudget
+      // has the whole argument, and test/stale.test.mjs has the schedule that survived
+      // the roster guard. So this request takes an exclusive claim on its own key and on
+      // every key it is about to retire, and holds all of them until it answers.
+      //
+      // Not getting its OWN key is a refusal. Usually that means another request is
+      // writing or retiring that endpoint right now, and a second writer behind it is
+      // precisely what the claim exists to prevent — but not always, and the response
+      // cannot tell them apart: claimKeys also grants nothing when the object is at
+      // MAX_CLAIMS, when the binding is missing, or when the call fails or answers with
+      // something it cannot decode. All of those refuse the registration, which is the
+      // direction this errs on deliberately; none of them is distinguishable from
+      // contention here, and all of them are transient to the client.
+      //
+      // A candidate it cannot claim is simply not its to
+      // retire and drops out of the sweep — the same trade the confirmation below makes,
+      // where a retained duplicate costs an extra push until the cron prunes it and a
+      // wrongly deleted record costs every future alert.
+      //
+      // Taken BEFORE the occupancy caps and the write reservation, which is a change
+      // from where it first went. It has to precede the confirmation below — the
+      // confirmation is worth nothing unless the key is already held — and the caps read
+      // the result of both, so this is the only place it can sit. A registration the caps
+      // then reject has spent a claim and releases it in the finally; a refusal here has
+      // nothing to refund, since the reservation comes after.
+      //
+      // The cost of refusing on the own key, also stated rather than fixed: two
+      // overlapping registrations of the SAME endpoint both used to return 200 and write
+      // the same record, and now one is told to retry. The client maps an unrecognised
+      // 5xx to "try again shortly", which is accurate here. Distinguishing them would
+      // need a shared claim for writers and an exclusive one for retirement — a
+      // reader/writer lock for a case whose whole symptom is one retry.
+      const grant = await claimKeys(env, [key, ...stale])
+      if (!grant.names.includes(key)) {
+        await releaseKeys(env, grant)
         if (rebuilt) await saveIndex(env, idx)
-        return json({ error: 'too many subscriptions from this network' }, 429)
-      }
-
-      // A ceiling on the store, counting what the retirement above will free first.
-      // A phone re-registering with its installId intact replaces its own prior record
-      // and does not grow the store; checking before the sweep turned that into a 429.
-      // (A true REINSTALL has lost that installId and is not helped by this.) Nothing
-      // is deleted until this passes, so a rejected request leaves the store as it was.
-      //
-      // Counted from the index, which is NOT serialized, so under concurrency this is
-      // not a bound at all. Registrations that read the roster together each save a
-      // version holding only their own addition; the losers' entries vanish while
-      // their records stay in KV, so the roster under-counts and therefore keeps
-      // admitting. The rebuild repairs it within five minutes, but the error grows
-      // until then rather than staying put.
-      //
-      // Measured 2026-10-29 against this code, with ~2ms of KV latency to make the
-      // read-to-write window realistic (a zero-latency stub does not reproduce it and
-      // reports every cap holding):
-      //   49 seeded + 12 concurrent  -> 61 records stored, cap 50
-      //   3 seeded + 20 concurrent from ONE source -> 20 records, MAX_PER_IP 12,
-      //                                               roster reporting only 4
-      // So treat both caps as sequential limits. They are honest against a client in
-      // a loop and against ordinary use; they are not a defence against a burst.
-      //
-      // The obvious fix — move this roster into the WriteBudget Durable Object so
-      // read, decide and mutate are one indivisible step, as the budget counters
-      // already are — was designed and reviewed on 2026-10-29, and it is NOT
-      // sufficient. Do not reach for it without reading why:
-      //
-      //   The roster would be inside the lock; the KV record write and the stale
-      //   deletes stay outside it. So the roster can never represent operations in
-      //   flight. A rebuild landing between an admission and its KV write rebuilds
-      //   from a KV that does not contain the new record yet, erasing a live
-      //   admission and freeing its slot to someone else. Compensating for a failed
-      //   write needs an admission identity the design did not have, so a late
-      //   rollback can undo a LATER success. And a stale-delete list computed from
-      //   an earlier snapshot can delete a record that a newer registration just
-      //   wrote — which this code can already do today, independently of any of it.
-      //
-      // Serializing the roster does not make the registration lifecycle atomic, and
-      // only the lifecycle gives a hard bound. Doing KV I/O under the lock also adds
-      // a failure mode that does not exist now: blockConcurrencyWhile has a 30-second
-      // cap and RESETS the object when exceeded, which guard()'s try/catch cannot
-      // intercept because it is not an exception.
-      //
-      // Deliberately not done. The store has one real subscriber, so the exposure is
-      // theoretical, and the honest comparison is a briefly wrong cap against a
-      // distributed two-store operation that can erase a real registration. The
-      // design packet and the probes that produced the numbers above are in the
-      // session scratchpad.
-      // A truncated page undercounts the store, and subtracting retirements from an
-      // undercount can admit past the cap. With limit 100 against a cap of 50 that only
-      // happens to a store already far over it, where rejecting is the right answer.
-      // Absence of the field counts as complete, so a KV response without it can never
-      // lock registration out.
-      const truncated = idx.complete === false
-      if (!existing && (truncated || names.length - stale.length >= MAX_RECORDS)) {
-        if (rebuilt) await saveIndex(env, idx)
-        return json({ error: 'subscription limit reached' }, 429)
-      }
-
-      // Last gate before anything is written. Deliberately after the occupancy caps,
-      // which are about what the store holds; this one is about what today has cost.
-      // The reservation is taken BEFORE the writes it pays for and handed back below
-      // if any of them fail, so a charge can never be smaller than what was spent.
-      const reservation = await reserveWrites(env, ipHash)
-      if (reservation.status !== 'ok') {
-        if (rebuilt) await saveIndex(env, idx)
-        if (reservation.status === 'unavailable') return json({ error: 'busy, retry shortly' }, 503)
-        return json({ error: 'registration budget exhausted for today' }, 429)
-      }
-
-      // Never downgrade a stored installId to null. A client whose storage is blocked,
-      // or an older one that sends none, would otherwise strip that install's ability to
-      // retire its own record later — silently, and permanently.
-      let keepInstallId = installId
-      if (!keepInstallId && existing) {
-        try {
-          const prev = JSON.parse(existing)
-          if (prev && typeof prev === 'object' && validInstallId(prev.installId)) keepInstallId = prev.installId
-        } catch {
-          /* unreadable previous value — nothing to carry over */
-        }
-      }
-
-      // The index still goes before the record, for a different reason now that the
-      // charge lives elsewhere: if one of the two writes is going to fail, an index
-      // entry with no record behind it over-counts the store, which refuses a later
-      // registration, while a record the index has not seen under-counts it, which
-      // admits one past the cap. Only the first is a safe direction, and the rebuild
-      // clears it within five minutes either way.
-      //
-      // KV caps writes to one key at one per second and a source may burst five
-      // requests inside a throttle window, so losing this race is routine rather
-      // than exceptional. The loser writes nothing, hands its reservation back, and
-      // is told to retry.
-      for (const name of stale) delete idx.e[name]
-      idx.e[key] = [keepInstallId ?? null, ipHash ?? null]
-      if (!(await saveIndex(env, idx))) {
-        // Nothing was spent, so the whole reservation goes back.
-        await refundWrites(env, ipHash, WRITES_PER_REGISTRATION, reservation.day)
         return json({ error: 'busy, retry shortly' }, 503)
       }
-
-      // The record goes in BEFORE the old ones come out. The other order deleted a
-      // working registration and then, if this write failed, left the device with
-      // neither: alerts silently stopped during what was an ordinary endpoint
-      // replacement. Wrapped so a failure also hands the reservation back rather
-      // than leaving the day charged for something that was never stored.
+      stale = stale.filter(name => grant.names.includes(name))
       try {
-        await env.SUBS.put(
-          key,
-          JSON.stringify({
-            subscription,
-            teamId,
-            device,
-            installId: keepInstallId,
-            ipHash,
-            t: Date.now(),
-          }),
-          // Mirrored into metadata so a rebuild can read it straight off list()
-          // without fetching values. Both are short; KV allows 1024 bytes per key.
-          { metadata: { installId: keepInstallId, ipHash } },
-        )
-      } catch {
-        // One write of the three DID happen: the index save above, which cannot be
-        // taken back. Refunding the full reservation would hand back budget for a
-        // write that was really spent, so only the two that did not happen go back.
-        // Nothing has been deleted at this point, so the caller keeps whatever it
-        // already had.
-        await refundWrites(env, ipHash, WRITES_PER_REGISTRATION - 1, reservation.day)
-        return json({ error: 'could not store the subscription' }, 503)
-      }
-
-      // Safe now: the replacement exists.
-      //
-      // `stale` was computed from a roster read several KV operations ago, and it is
-      // permission to delete a key based on that snapshot. By now one of those keys
-      // can belong to a NEWER registration: two overlapping calls for one installId,
-      // one moving to Y and one re-registering X, each see the other's record as
-      // stale and delete it, and the device is left with nothing though both writes
-      // returned 200. Measured on this code — it needs the losing delete to stall,
-      // which is why uniform-latency concurrency never reproduces it.
-      //
-      // So re-read the roster and treat it as the authority on what is still ours to
-      // retire. A name present again was put back by someone after our snapshot, and
-      // deleting it would destroy a live registration.
-      //
-      // This narrows the window; it does not close it. KV has no compare-and-delete,
-      // so nothing checked BEFORE a delete can bind a delete that then stalls. The
-      // schedule that survives: A writes Y and begins deleting X; B claims the roster,
-      // writes X, reads a roster without Y and deletes Y; A's stalled delete then
-      // removes X. Both guards passed and both records are gone.
-      //
-      // A reconciler working from one consistent listing does NOT close that either —
-      // a consistent snapshot still cannot stop a later delete racing a concurrent
-      // replacement. Closing it needs coordination with writers: a version or identity
-      // on the record that the delete can be made conditional on. See the cap-check
-      // block above for why the obvious serialization does not work either.
-      //
-      // Failing to read the roster means skipping the deletes, not doing them blind.
-      // The asymmetry is the whole point, though the cost of skipping is recurring
-      // rather than one-off: a retained registration draws an extra push on EVERY
-      // notification until its endpoint 404s and the cron prunes it, and an identical
-      // re-registration returns early without sweeping, so it does not repair it. A
-      // record wrongly deleted still costs more — that device loses every future
-      // alert, silently and permanently.
-      let retired = 0
-      if (stale.length) {
-        const live = await liveEntries(env)
+        // NOW that the keys are held, ask each RECORD whether it is still this install's
+        // to retire — and nothing can invalidate the answer before the delete.
+        //
+        // The candidate list came from a roster snapshot, and a snapshot is not
+        // authority: the record at one of those keys can have changed hands since. There
+        // is a real yield point for it, which is the part that makes this necessary
+        // rather than theoretical — a registration that finds the index stale and is
+        // REFUSED the rebuild grant awaits that refusal and then carries on with what it
+        // read before asking. Peer review supplied the schedule: install I reads a roster
+        // listing X as its own, install J re-registers that same endpoint (its
+        // localStorage cleared, its push endpoint intact), and I then deletes J's brand
+        // new record while J has been told it succeeded.
+        //
+        // Re-reading the roster would not have fixed it, and that was the first version
+        // of this change: the roster cannot answer whose a record is. retirableBy says
+        // why, and says what this check does and does not guarantee — exclusion keeps a
+        // later writer out, it does not make an eventually consistent read fresh.
+        //
+        // One read per candidate, charged for up front: READS_PER_SUBSCRIBE is sized
+        // against MAX_SWEEP for exactly this, which is also why the list is capped above.
+        const confirmed = []
         for (const name of stale) {
-          if (!live || name in live) continue
+          if (await retirableBy(env, name, installId)) confirmed.push(name)
+        }
+        stale = confirmed
+
+        // Records this install is about to retire do not count against its own source, so
+        // re-registering a device never blocks itself. Skipped when the record already
+        // exists: updating a registration in place adds nothing to the store.
+        // An UPDATE reassigns the record's ipHash to whoever sent it, and the check
+        // below used to run only for new records — so a caller could create records
+        // from many sources, then update each one from a single source and move the
+        // whole lot into that source's allocation without it ever being counted.
+        // Only its own endpoints are needed. A transfer into a source is an addition
+        // to that source, so it is checked like one.
+        const prevIpHash = existing ? (idx.e[key] || [])[1] ?? null : null
+        const movingSource = !!existing && !!ipHash && prevIpHash !== ipHash
+        if ((!existing || movingSource) && ipHash && sameSource - sameSourceCandidates >= MAX_PER_IP) {
+          if (rebuilt) await saveIndex(env, idx)
+          return json({ error: 'too many subscriptions from this network' }, 429)
+        }
+
+        // A ceiling on the store, counting what the retirement above will free first.
+        // A phone re-registering with its installId intact replaces its own prior record
+        // and does not grow the store; checking before the sweep turned that into a 429.
+        // (A true REINSTALL has lost that installId and is not helped by this.) Nothing
+        // is deleted until this passes, so a rejected request leaves the store as it was.
+        //
+        // Counted from the index, which is NOT serialized, so under concurrency this is
+        // not a bound at all. Registrations that read the roster together each save a
+        // version holding only their own addition; the losers' entries vanish while
+        // their records stay in KV, so the roster under-counts and therefore keeps
+        // admitting. The rebuild repairs it within five minutes, but the error grows
+        // until then rather than staying put.
+        //
+        // Measured 2026-10-29 against this code, with ~2ms of KV latency to make the
+        // read-to-write window realistic (a zero-latency stub does not reproduce it and
+        // reports every cap holding):
+        //   49 seeded + 12 concurrent  -> 61 records stored, cap 50
+        //   3 seeded + 20 concurrent from ONE source -> 20 records, MAX_PER_IP 12,
+        //                                               roster reporting only 4
+        // So treat both caps as sequential limits. They are honest against a client in
+        // a loop and against ordinary use; they are not a defence against a burst.
+        //
+        // The obvious fix — move this roster into the WriteBudget Durable Object so
+        // read, decide and mutate are one indivisible step, as the budget counters
+        // already are — was designed and reviewed on 2026-10-29, and it is NOT
+        // sufficient. Do not reach for it without reading why:
+        //
+        //   The roster would be inside the lock; the KV record write and the stale
+        //   deletes stay outside it. So the roster can never represent operations in
+        //   flight. A rebuild landing between an admission and its KV write rebuilds
+        //   from a KV that does not contain the new record yet, erasing a live
+        //   admission and freeing its slot to someone else. Compensating for a failed
+        //   write needs an admission identity the design did not have, so a late
+        //   rollback can undo a LATER success. And a stale-delete list computed from
+        //   an earlier snapshot can delete a record that a newer registration just
+        //   wrote — which this code can already do today, independently of any of it.
+        //
+        // Serializing the roster does not make the registration lifecycle atomic, and
+        // only the lifecycle gives a hard bound. Doing KV I/O under the lock also adds
+        // a failure mode that does not exist now: blockConcurrencyWhile has a 30-second
+        // cap and RESETS the object when exceeded, which guard()'s try/catch cannot
+        // intercept because it is not an exception.
+        //
+        // Deliberately not done. The store has one real subscriber, so the exposure is
+        // theoretical, and the honest comparison is a briefly wrong cap against a
+        // distributed two-store operation that can erase a real registration. The
+        // design packet and the probes that produced the numbers above are in the
+        // session scratchpad.
+        // A truncated page undercounts the store, and subtracting retirements from an
+        // undercount can admit past the cap. With limit 100 against a cap of 50 that only
+        // happens to a store already far over it, where rejecting is the right answer.
+        // Absence of the field counts as complete, so a KV response without it can never
+        // lock registration out.
+        const truncated = idx.complete === false
+        if (!existing && (truncated || names.length - candidates.length >= MAX_RECORDS)) {
+          if (rebuilt) await saveIndex(env, idx)
+          return json({ error: 'subscription limit reached' }, 429)
+        }
+
+        // Last gate before anything is written. Deliberately after the occupancy caps,
+        // which are about what the store holds; this one is about what today has cost.
+        // The reservation is taken BEFORE the writes it pays for and handed back below
+        // if any of them fail, so a charge can never be smaller than what was spent.
+        const reservation = await reserveWrites(env, ipHash)
+        if (reservation.status !== 'ok') {
+          if (rebuilt) await saveIndex(env, idx)
+          if (reservation.status === 'unavailable') return json({ error: 'busy, retry shortly' }, 503)
+          return json({ error: 'registration budget exhausted for today' }, 429)
+        }
+
+        // Never downgrade a stored installId to null. A client whose storage is blocked,
+        // or an older one that sends none, would otherwise strip that install's ability to
+        // retire its own record later — silently, and permanently.
+        let keepInstallId = installId
+        if (!keepInstallId && existing) {
+          try {
+            const prev = JSON.parse(existing)
+            if (prev && typeof prev === 'object' && validInstallId(prev.installId)) keepInstallId = prev.installId
+          } catch {
+            /* unreadable previous value — nothing to carry over */
+          }
+        }
+
+        // The index still goes before the record, for a different reason now that the
+        // charge lives elsewhere: if one of the two writes is going to fail, an index
+        // entry with no record behind it over-counts the store, which refuses a later
+        // registration, while a record the index has not seen under-counts it, which
+        // admits one past the cap. Only the first is a safe direction, and the rebuild
+        // clears it within five minutes either way.
+        //
+        // KV caps writes to one key at one per second and a source may burst five
+        // requests inside a throttle window, so losing this race is routine rather
+        // than exceptional. The loser writes nothing, hands its reservation back, and
+        // is told to retry.
+        for (const name of stale) delete idx.e[name]
+        idx.e[key] = [keepInstallId ?? null, ipHash ?? null]
+        if (!(await saveIndex(env, idx))) {
+          // Nothing was spent, so the whole reservation goes back.
+          await refundWrites(env, ipHash, WRITES_PER_REGISTRATION, reservation.day)
+          return json({ error: 'busy, retry shortly' }, 503)
+        }
+
+        // The record goes in BEFORE the old ones come out. The other order deleted a
+        // working registration and then, if this write failed, left the device with
+        // neither: alerts silently stopped during what was an ordinary endpoint
+        // replacement. Wrapped so a failure also hands the reservation back rather
+        // than leaving the day charged for something that was never stored.
+        try {
+          await env.SUBS.put(
+            key,
+            JSON.stringify({
+              subscription,
+              teamId,
+              device,
+              installId: keepInstallId,
+              ipHash,
+              t: Date.now(),
+            }),
+            // Mirrored into metadata so a rebuild can read it straight off list()
+            // without fetching values. Both are short; KV allows 1024 bytes per key.
+            { metadata: { installId: keepInstallId, ipHash } },
+          )
+        } catch {
+          // One write of the three DID happen: the index save above, which cannot be
+          // taken back. Refunding the full reservation would hand back budget for a
+          // write that was really spent, so only the two that did not happen go back.
+          // Nothing has been deleted at this point, so the caller keeps whatever it
+          // already had.
+          await refundWrites(env, ipHash, WRITES_PER_REGISTRATION - 1, reservation.day)
+          return json({ error: 'could not store the subscription' }, 503)
+        }
+
+        // Safe now: the replacement exists.
+        //
+        // `stale` was computed from a roster read several KV operations ago, and it is
+        // permission to delete a key based on that snapshot. By now one of those keys
+        // can belong to a NEWER registration: two overlapping calls for one installId,
+        // one moving to Y and one re-registering X, each see the other's record as
+        // stale and delete it, and the device is left with nothing though both writes
+        // returned 200. Measured on this code. It needs no stall: a timer-based harness
+        // could only find it by lengthening the losing delete, but the barrier
+        // enumeration in test/stale.test.mjs reaches it with ordinary operation ordering,
+        // which is what made it worth closing rather than documenting.
+        //
+        // On its own, a check before the delete narrowed the window and did not close
+        // it, and the schedule that survived is the reason every name here is claimed:
+        // A writes Y and begins deleting X; B takes the roster, writes X, reads a roster
+        // without Y and deletes Y; A delete then removes X. Both checks passed and both
+        // records were gone. Nothing checked BEFORE a delete can bind that delete, so
+        // the claim keeps B out of the window instead of trying to detect it from
+        // inside — see the claim section above WriteBudget.
+        //
+        // A reconciler working from one consistent listing would NOT have closed it
+        // either: a consistent snapshot cannot stop a later delete racing a concurrent
+        // replacement. That claim was in the first draft of this comment and is wrong.
+        // See the cap-check block above for why serializing the roster does not work.
+        //
+        // What stands between the claim and these deletes is the per-record confirmation
+        // above, not a roster re-read: that re-read used to live HERE, after the index
+        // save, and peer review showed it could not work from this position at all —
+        // the save has just dropped every candidate from the roster, so a roster read
+        // here sees them absent and reads that as licence. Both halves of the current
+        // check are above, before any write.
+        //
+        // No check at this point, then. Every name left in `stale` is one this request
+        // holds a claim on and confirmed from the record itself, and no cooperating
+        // writer can have touched it since. What CAN still make that confirmation wrong
+        // is a stale KV read of the record — retirableBy says so, and the residual block
+        // in test/stale.test.mjs pins it. Re-asking here would not help: it would be the
+        // same unbindable check, one operation later.
+        let retired = 0
+        for (const name of stale) {
           try {
             await env.SUBS.delete(name)
             retired++
           } catch {
-            // The replacement is stored, so the registration succeeded. A failed
-            // delete leaves a duplicate for the cron to prune on 404/410; turning it
-            // into an error would make the client retry something that already worked.
+            // The replacement is stored, so the registration succeeded. A failed delete
+            // leaves a duplicate for the cron to prune on 404/410; turning it into an
+            // error would make the client retry something that already worked.
           }
         }
-      }
 
-      // The index was written above, before any of this. Deletions are reflected in
-      // it here and from /unsubscribe: an earlier version left them to the rebuild,
-      // reasoning that an index listing a deleted record only over-counts and
-      // over-counting merely rejects. That was wrong, because an attacker can DRIVE
-      // the over-count — alternating /subscribe and /unsubscribe packs the index with
-      // entries whose records are gone, and at twenty of them every registration is
-      // refused, for everyone, while the store itself is empty.
-      // Retirements that actually happened, not candidates identified. The guard can
-      // skip one, and counting it as retired would hide exactly the case that leaves
-      // a duplicate behind.
-      return json({ ok: true, replaced: retired })
+        // The index was written above, before any of this. Deletions are reflected in
+        // it there and from /unsubscribe: an earlier version left them to the rebuild,
+        // reasoning that an index listing a deleted record only over-counts and
+        // over-counting merely rejects. That was wrong, because an attacker can DRIVE
+        // the over-count — alternating /subscribe and /unsubscribe packs the index with
+        // entries whose records are gone, and at twenty of them every registration is
+        // refused, for everyone, while the store itself is empty.
+        //
+        // "There" and not here, and that ordering has a cost worth naming: the index save
+        // drops every confirmed candidate BEFORE the deletes run, so a delete that throws
+        // leaves its record stored and unlisted. The store then under-counts, which is
+        // the direction that admits past the cap, until a rebuild reconciles it. Removing
+        // the entries after the deletes instead would mean a second write to one key in
+        // one request, which KV answers with a 429 — see saveIndex. Peer review found the
+        // comment here implying the index tracked what was actually deleted; it does not,
+        // and only `replaced` does.
+        //
+        // Retirements that actually happened, not candidates identified. A confirmation
+        // can refuse one, and counting it as retired would hide exactly the case that
+        // leaves a duplicate behind.
+        return json({ ok: true, replaced: retired })
+      } finally {
+        // Unconditional, and the only reason the span above is a try at all. This
+        // guarantees the attempt and not the release: releaseKeys swallows a transport
+        // failure and does not read the response status, so a request that answers
+        // normally can still leave its claims standing until they expire — every key in
+        // the grant, not one. The expiry is the backstop for that as much as for a
+        // request that dies outright.
+        await releaseKeys(env, grant)
+      }
     }
 
     if (url.pathname === '/unsubscribe' && req.method === 'POST') {
@@ -1105,8 +1431,42 @@ export default {
       // button sends no Authorization header, and demanding one would break it.
       if (authed) {
         const pruned = await subKey(body.endpoint)
-        await env.SUBS.delete(pruned)
-        await dropFromIndex(env, pruned)
+        // Claimed, like every other delete in this worker. Peer review found this path
+        // outside the exclusion entirely: suspend a prune just before its delete, let a
+        // registration claim that endpoint and store a record there, and the prune then
+        // removes a registration that had just succeeded — and if that registration was
+        // retiring an older record of its own, the device is left with neither.
+        //
+        // Refused usually means somebody is writing or retiring this endpoint right now,
+        // so the record about to be there is not the dead one the cron decided to prune.
+        // It is skipped rather than forced, and the next run prunes it if it is still
+        // dead. The reply stays {ok:true} either way — the cron does not read the body,
+        // and making it an error would turn a transient overlap into a red run.
+        //
+        // What the claim does NOT fix, and the second review was right to press on it:
+        // the prune carries an endpoint and no identity for the record the cron actually
+        // decided about. So a prune that is merely SLOW — suspended before it claims,
+        // rather than overlapping — resumes after a registration has finished, claims a
+        // key nobody holds any more, and deletes a record written after the decision was
+        // taken. The device loses that registration and the older one the registration
+        // retired on its way in. Exclusion cannot see a decision made outside it.
+        //
+        // Closing it needs the cron to say WHICH record it means — the stored `t`, say,
+        // handed back from GET /subs and compared here — which changes that response's
+        // contract and scripts/notify.mjs with it. Not done. The exposure is small: a
+        // prune follows a 404/410 from the push service, and a 410 endpoint is gone for
+        // good, so a device re-registering that exact endpoint in the window is close to
+        // implausible. A deliberate user unsubscribe deleting an intervening
+        // registration is correct behaviour and not this case.
+        const grant = await claimKeys(env, [pruned])
+        try {
+          if (grant.names.length) {
+            await env.SUBS.delete(pruned)
+            await dropFromIndex(env, pruned)
+          }
+        } finally {
+          await releaseKeys(env, grant)
+        }
         return json({ ok: true })
       }
 
@@ -1152,10 +1512,21 @@ export default {
       //    still live at the moment of the check. The record clears only if that local
       //    unsubscribe succeeds, a later push is attempted, the service answers
       //    404/410, and the cron's own prune then lands.
+      // 4. And claim it, for the same reason the authenticated path above does: this
+      //    delete is by name, and a /subscribe may be writing that very key. The
+      //    existence check below is not atomic with the delete either, and the claim is
+      //    what makes it binding — nothing can write the key between the two. A refused
+      //    claim skips the delete, which is the same miss the eventual-consistency note
+      //    below already describes and recovers the same way.
       const key = await subKey(body.endpoint)
-      if ((await env.SUBS.get(key)) !== null) {
-        await env.SUBS.delete(key)
-        await dropFromIndex(env, key)
+      const grant = await claimKeys(env, [key])
+      try {
+        if (grant.names.length && (await env.SUBS.get(key)) !== null) {
+          await env.SUBS.delete(key)
+          await dropFromIndex(env, key)
+        }
+      } finally {
+        await releaseKeys(env, grant)
       }
       return json({ ok: true })
     }
