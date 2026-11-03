@@ -11,17 +11,17 @@
     "deploy": "npm run build && firebase deploy --only hosting"
   },
   "dependencies": {
-    "lucide-react": "latest",
+    "lucide-react": "^1.31.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "latest",
-    "@vitejs/plugin-react": "latest",
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.0.5",
     "sharp": "^0.35.3",
     "sharp-ico": "^0.1.5",
-    "tailwindcss": "latest",
-    "vite": "latest",
-    "vite-plugin-pwa": "latest"
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.5",
+    "vite-plugin-pwa": "^2.0.0"
   }
 }
