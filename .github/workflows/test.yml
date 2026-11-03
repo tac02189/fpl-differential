@@ -23,8 +23,14 @@ jobs:
     # the outer net for a failure that stops the runner itself from finishing.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # v7, not v4: the v4 actions declare Node 20, which GitHub now forces onto
+      # Node 24 and annotates every run about. Both were bumped 2026-11-03. The one
+      # behaviour change in the majors between is setup-node v5's automatic caching,
+      # which engages only on a `packageManager` field in package.json — this project
+      # has none, and `package-manager-cache: false` is the off switch if it ever does.
+      # Major tags float, so these pick up patches without another edit here.
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: npm test

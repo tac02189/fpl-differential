@@ -20,8 +20,9 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # v7 for the same reason as in test.yml, where the reasoning is written out.
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       # A registry ECONNRESET failed the 2026-10-23 20:00Z run here, emailing a red
