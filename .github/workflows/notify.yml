@@ -8,7 +8,16 @@ concurrency:
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    # Twice an hour, deliberately off :00 and :30. GitHub's docs say scheduled runs are
+    # delayed under high load, that the start of every hour is a high-load time, that
+    # some queued runs may then be dropped, and that another minute lowers the chance of
+    # delay. :30 is where every */30, */15, */10 and */5 schedule fires too; :13 and :43
+    # are clear of all of them. Whether that also means fewer dropped runs is what this
+    # is testing. Baseline on */30, scheduled runs 2026-10-04 to 11-04: 5.05 a day of a
+    # possible 48, median gap 4.75h, p90 7.07h, max 9.63h, which is what the reminder
+    # windows in scripts/notify.mjs are sized for. Still 48 ticks a day, so the worker's
+    # KV budget is unchanged.
+    - cron: '13,43 * * * *'
   workflow_dispatch:
     inputs:
       test:
