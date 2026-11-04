@@ -1,5 +1,6 @@
 // Notification cron — scheduled every 30 min on GitHub Actions (see notify.yml), though
-// GitHub actually fires ~15% of those ticks; the reminder windows are sized for that.
+// GitHub actually fires ~11% of those ticks (about five runs a day, measured 2026-11-03);
+// the reminder windows are sized for that.
 // Sends Web Push: deadline reminders (day-before / final) and injury alerts for owned players.
 // Subscriptions + dedup state live in the Cloudflare Worker's KV (same worker as the CORS proxy).
 //
@@ -204,9 +205,31 @@ export function planInjuryAlerts({ subs, players, ownedBy, keyOf, seen }) {
   return out
 }
 
-const hoursLeft = hrs => {
-  const h = Math.floor(hrs)
-  const m = Math.round((hrs - h) * 60)
+// Reminder windows, in hours before the deadline. Measured 2026-09-11, GitHub fired ~15%
+// of the */30 ticks (median gap 3.1h, p90 5h, max 6.5h), and a 6h final window caught a
+// run 99.7% of the time where 3h managed 78%. Re-measured 2026-11-03 over the scheduled
+// runs since 2026-10-04, it fires ~11% (median gap 4.7h, p90 7.0h, max 9.6h), and a 6h
+// window would leave about one gameweek in twenty with no final reminder. 8h brings that
+// to about one in two hundred, and the day-before window keeps 16h, longer than any gap
+// measured. The final reminder's title carries the true time left, so it reads correctly
+// whenever it fires. src/components/SettingsSheet.jsx describes these windows to the
+// user; change both together.
+const FINAL_WINDOW_H = 8
+const DAY_BEFORE_H = 24
+
+// Pure so scripts/test-notify-plan.mjs can pin the boundaries. The phase names are the
+// original T-2h / T-24h windows; they are stored in state.sent, so they keep those names.
+export function reminderPhase(hrs) {
+  if (hrs > 0 && hrs <= FINAL_WINDOW_H) return 't2'
+  if (hrs > FINAL_WINDOW_H && hrs <= DAY_BEFORE_H) return 't24'
+  return null
+}
+
+// Rounds to whole minutes FIRST, so 6.999h reads "7h 00m" rather than "6h 60m".
+export function hoursLeft(hrs) {
+  const total = Math.round(hrs * 60)
+  const h = Math.floor(total / 60)
+  const m = total % 60
   return h > 0 ? `${h}h ${String(m).padStart(2, '0')}m` : `${m} minutes`
 }
 const queue = [] // { sub, payload, onDelivered? }
@@ -248,16 +271,13 @@ async function ownedPlayers(teamId) {
   return picksCache.get(key)
 }
 
-// --- deadline reminders (T-24h and T-2h), delivery tracked per subscriber ---
+// --- deadline reminders (day-before and final), delivery tracked per subscriber ---
 if (next) {
   const dlKey = `${next.id}|${next.deadline_time}`
   const hrs = (new Date(next.deadline_time) - Date.now()) / 3.6e6
   const sent = (state.sent[dlKey] ||= {})
-  // Measured 2026-09-11: GitHub fires only ~15% of the */30 ticks (median gap 3.1h,
-  // p90 5h, max 6.5h). Against that real timeline a 3h final window lands a run just
-  // 78% of the time — one gameweek in five with no last reminder. 6h gets it to 99.7%.
-  // The body carries the true time left, so it reads correctly whenever it fires.
-  const phase = hrs > 0 && hrs <= 6 ? 't2' : hrs > 6 && hrs <= 24 ? 't24' : null
+  // The window sizes, and the measurements behind them, are at FINAL_WINDOW_H.
+  const phase = reminderPhase(hrs)
   if (phase) {
     const delivered = new Set(sent[phase] || [])
     for (const sub of subs) {
@@ -279,7 +299,7 @@ if (next) {
         onDelivered: () => {
           delivered.add(k)
           sent[phase] = [...delivered]
-          // a late T-24 after the final reminder would only confuse
+          // a late day-before reminder after the final one would only confuse
           if (phase === 't2') sent.t24 = [...new Set([...(sent.t24 || []), k])]
         },
       })

@@ -1,4 +1,5 @@
-// Exercises planInjuryAlerts from notify.mjs without running the cron itself.
+// Exercises the pure parts of notify.mjs without running the cron itself:
+// planInjuryAlerts, and the deadline-reminder windows.
 //   node scripts/test-notify-plan.mjs
 // Guards the failure Codex found: one subscriber's broken endpoint must not
 // re-alert the subscribers who already received the notification.
@@ -11,6 +12,15 @@ const from = src.indexOf('const statusLabel')
 const to = src.indexOf('\n}', src.indexOf('return out', from)) + 2
 if (from < 0 || to < 2) throw new Error('could not locate planInjuryAlerts in notify.mjs')
 const { planInjuryAlerts } = await import('data:text/javascript,' + encodeURIComponent(src.slice(from, to)))
+
+// Same for the reminder windows: the two constants through the end of hoursLeft.
+// Each index is checked on its own, because a missed marker would otherwise make the
+// next indexOf search from the top of the file and load the wrong slice.
+const rFrom = src.indexOf('const FINAL_WINDOW_H')
+const rFn = src.indexOf('export function hoursLeft', rFrom)
+const rTo = rFn < 0 ? -1 : src.indexOf('\n}', rFn) + 2
+if (rFrom < 0 || rFn < 0 || rTo < 2) throw new Error('could not locate the reminder windows in notify.mjs')
+const { reminderPhase, hoursLeft } = await import('data:text/javascript,' + encodeURIComponent(src.slice(rFrom, rTo)))
 
 const A = { subscription: { endpoint: 'https://fcm.googleapis.com/A' }, teamId: '1' }
 const B = { subscription: { endpoint: 'https://fcm.googleapis.com/B' }, teamId: '2' }
@@ -75,6 +85,23 @@ check(
   planInjuryAlerts({ subs, players: salahHurt, ownedBy: partial, keyOf, seen }).map(p => p.subKey),
   ['A'],
 )
+
+// --- deadline-reminder windows ---
+// The final window was 6h until 2026-11-03, so 7h out sent the day-before reminder.
+check('7h out sends the final reminder', reminderPhase(7), 't2')
+check('the final window includes its edge (8h)', reminderPhase(8), 't2')
+check('just past 8h is the day-before reminder', reminderPhase(8.01), 't24')
+check('a minute out is still the final reminder', reminderPhase(1 / 60), 't2')
+check('the day-before window includes its edge (24h)', reminderPhase(24), 't24')
+check('beyond 24h sends nothing', reminderPhase(24.01), null)
+check('at the deadline sends nothing', reminderPhase(0), null)
+check('after the deadline sends nothing', reminderPhase(-0.5), null)
+check('an unparseable deadline sends nothing', reminderPhase(NaN), null)
+// A test of the function proves nothing if the cron stops calling it.
+check('the cron takes its phase from reminderPhase', /const phase = reminderPhase\(hrs\)/.test(src), true)
+check('time left rounds before splitting (no "6h 60m")', hoursLeft(6.9999), '7h 00m')
+check('time left pads the minutes', hoursLeft(7.1), '7h 06m')
+check('under an hour reads in minutes', hoursLeft(0.75), '45 minutes')
 
 // Same wording as the suites under test/, so the runner can count these checks
 // toward its total instead of reporting the suite as untallied.

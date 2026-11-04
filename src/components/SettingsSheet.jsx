@@ -139,8 +139,8 @@ export default function SettingsSheet() {
                       : 'Enable deadline & injury alerts'}
                 </button>
                 <p className="mt-1 text-[0.72rem] leading-snug text-mute">
-                  Deadline reminders 24h and 2h out, plus injury news on your players. iPhone needs the app installed
-                  to the Home Screen.
+                  Deadline reminders about a day out and again in the final 8 hours, plus injury news on your
+                  players. iPhone needs the app installed to the Home Screen.
                 </p>
                 {pushError && <p className="mt-1 text-[0.72rem] text-flag">{pushError}</p>}
               </>

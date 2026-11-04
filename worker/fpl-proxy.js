@@ -1238,7 +1238,9 @@ export default {
         //   write needs an admission identity the design did not have, so a late
         //   rollback can undo a LATER success. And a stale-delete list computed from
         //   an earlier snapshot can delete a record that a newer registration just
-        //   wrote — which this code can already do today, independently of any of it.
+        //   wrote. (This code could too, independently of any of it, until the key
+        //   claims and the per-record check in retirableBy closed it; what is left is
+        //   the eventually consistent record read that retirableBy describes.)
         //
         // Serializing the roster does not make the registration lifecycle atomic, and
         // only the lifecycle gives a hard bound. Doing KV I/O under the lock also adds
