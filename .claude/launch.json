@@ -10,6 +10,19 @@
       ],
       "port": 5173,
       "autoPort": true
+    },
+    {
+      "name": "fpl-differential-preview",
+      "runtimeExecutable": "C:\\Program Files\\nodejs\\node.exe",
+      "runtimeArgs": [
+        ".claude/npm-run.cjs",
+        "preview",
+        "--",
+        "--port",
+        "4173",
+        "--strictPort"
+      ],
+      "port": 4173
     }
   ]
 }
