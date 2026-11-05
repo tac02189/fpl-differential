@@ -208,12 +208,14 @@ export function planInjuryAlerts({ subs, players, ownedBy, keyOf, seen }) {
 // Reminder windows, in hours before the deadline. Measured 2026-09-11, GitHub fired ~15%
 // of the */30 ticks (median gap 3.1h, p90 5h, max 6.5h), and a 6h final window caught a
 // run 99.7% of the time where 3h managed 78%. Re-measured 2026-11-03 over the scheduled
-// runs since 2026-10-04, it fires ~11% (median gap 4.7h, p90 7.0h, max 9.6h), and a 6h
-// window would leave about one gameweek in twenty with no final reminder. 8h brings that
-// to about one in two hundred, and the day-before window keeps 16h, longer than any gap
-// measured. The final reminder's title carries the true time left, so it reads correctly
-// whenever it fires. src/components/SettingsSheet.jsx describes these windows to the
-// user; change both together.
+// runs from 2026-10-04 to then, it fires ~11% (median gap 4.7h, p90 7.0h, max 9.6h). The
+// share of that time with no run in the previous 6h was about 1 in 19, so roughly one
+// gameweek in twenty would get no final reminder from a 6h window; for 8h it was about
+// 1 in 165. Those are estimates from the gaps, which treat a deadline as equally likely at
+// any moment, not counts of missed gameweeks. The day-before window keeps 16h, longer than
+// any gap measured. The final reminder's title carries the true time left, so it reads
+// correctly whenever it fires. src/components/SettingsSheet.jsx describes these windows to
+// the user; change both together.
 const FINAL_WINDOW_H = 8
 const DAY_BEFORE_H = 24
 

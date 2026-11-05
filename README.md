@@ -25,8 +25,8 @@ read-only, no login; the app needs only a team ID and (optionally) a classic-lea
   Cloudflare Worker (`worker/fpl-proxy.js`) whose URL is set in `src/config.js`. `VITE_FPL_PROXY` overrides
   it at build time; a normal build needs nothing set.
 - Push notifications use standard Web Push (VAPID, no FCM console setup) with subscriptions stored in the
-  same Worker's Cloudflare KV and a GitHub Actions cron as the sender — deadline reminders (about a day out,
-  and again in the final 8 hours) and injury alerts. The cron is set for every 30 minutes, but GitHub runs it
+  same Worker's Cloudflare KV and a GitHub Actions cron as the sender — deadline reminders (8–24 hours ahead,
+  and in the final 8 hours) and injury alerts. The cron is set for every 30 minutes, but GitHub runs it
   about five times a day; the reminder windows in `scripts/notify.mjs` are sized for that. An early plan put
   subscriptions in Firestore; that was superseded before launch, and the project has no Firestore database.
 - Tests: `npm test` runs `test/run.mjs` — 18 suites (17 under `test/`, plus `scripts/test-notify-plan.mjs`),

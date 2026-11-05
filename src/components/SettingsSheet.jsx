@@ -2,6 +2,17 @@ import { useEffect, useState } from 'react'
 import { BellOff, BellRing, X } from 'lucide-react'
 import { useSettings } from '../state/SettingsContext'
 import { disablePush, enablePush, getSubscription, pushSupported } from '../lib/push'
+import { buildId, workerBuild } from '../lib/build'
+
+// Shown at the foot of the sheet so a deploy can be checked on the phone itself: the
+// build that is running, and whether the service worker in control serves the same one.
+// src/lib/build.js says what that check does and does not establish.
+const BUILD = buildId()
+const WORKER_NOTE = {
+  same: 'service worker serves this build',
+  differs: 'service worker serves another build — fully close and reopen',
+  none: 'no service worker in control',
+}
 
 function Field({ label, help, value, onChange, placeholder }) {
   return (
@@ -25,6 +36,7 @@ export default function SettingsSheet() {
   const [leagueId, setLeagueId] = useState(settings.leagueId)
   const [push, setPush] = useState('unknown') // on | off | busy | unavailable
   const [pushError, setPushError] = useState(null)
+  const [worker, setWorker] = useState(null) // same | differs | none | null
 
   useEffect(() => {
     if (sheetOpen) {
@@ -39,6 +51,26 @@ export default function SettingsSheet() {
         )
     }
   }, [sheetOpen]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The service-worker check runs when the sheet opens and again if a worker takes control
+  // while it is open. Only the newest check may set the line, and none after the sheet
+  // closes, so a slow reply cannot overwrite a newer one.
+  useEffect(() => {
+    if (!sheetOpen || !BUILD) return
+    let latest = 0
+    const check = () => {
+      const n = ++latest
+      workerBuild().then(s => n === latest && setWorker(s))
+    }
+    setWorker(null)
+    check()
+    const sw = navigator.serviceWorker
+    sw?.addEventListener('controllerchange', check)
+    return () => {
+      latest = -1
+      sw?.removeEventListener('controllerchange', check)
+    }
+  }, [sheetOpen])
 
   if (!sheetOpen) return null
 
@@ -139,7 +171,7 @@ export default function SettingsSheet() {
                       : 'Enable deadline & injury alerts'}
                 </button>
                 <p className="mt-1 text-[0.72rem] leading-snug text-mute">
-                  Deadline reminders about a day out and again in the final 8 hours, plus injury news on your
+                  Deadline reminders 8–24 hours ahead and in the final 8 hours, plus injury news on your
                   players. iPhone needs the app installed to the Home Screen.
                 </p>
                 {pushError && <p className="mt-1 text-[0.72rem] text-flag">{pushError}</p>}
@@ -152,9 +184,18 @@ export default function SettingsSheet() {
           >
             Save
           </button>
-          <p className="text-center text-[0.68rem] text-mute">
-            Read-only — data via the official FPL API, refreshed every 30 min. Transfers still happen in the FPL app.
-          </p>
+          <div className="text-center text-mute">
+            <p className="text-[0.68rem]">
+              Read-only — data via the official FPL API, refreshed every 30 min. Transfers still happen in the FPL
+              app.
+            </p>
+            {BUILD && (
+              <p className="mono mt-1 text-[0.62rem]">
+                Build {BUILD}
+                {WORKER_NOTE[worker] && ` · ${WORKER_NOTE[worker]}`}
+              </p>
+            )}
+          </div>
         </div>
       </div>
     </div>
