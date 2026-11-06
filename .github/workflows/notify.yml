@@ -43,11 +43,27 @@ jobs:
       # a bare failing command would abort the step and the loop would never retry.
       # A recovered attempt still leaves a warning annotation, so a degrading registry
       # stays visible instead of hiding behind a green run.
+      #
+      # Pinned to 3.x since 2026-11-06. The install named no version, so the first run
+      # after web-push 4.0.0 was published (11:44Z that day) picked it up. 4.0.0 is
+      # ESM-only with no default export, so `import webpush from 'web-push'` in notify.mjs
+      # threw at load and the 17:58Z run failed before reading anything.
+      # 4.x is not taken on purpose. It was hours old, it rewrites the library as ESM
+      # classes, and the one fix in its commit log (#999) refreshed only its own repo's
+      # lockfile. An isolated npm dry run that day resolved the same jws 4.0.1, jwa 2.0.1
+      # and bn.js 4.12.5 under both; they differed in http_ece (1.2.0 vs 1.2.1, whose only
+      # release note is a test-runner switch), the proxy agent (7 vs 9) and minimist, none
+      # with a GitHub advisory at those versions. This project's lockfile pins only debug
+      # and ms from that tree, at the same versions. Moving to 4.x means changing that
+      # import and confirming a test push reaches a phone, not just bumping this line.
+      # The version is echoed because npm prints only a package count, and it read
+      # "added 383 packages" for both 3.6.7 and 4.0.0.
       - name: Install web-push (retry transient registry failures)
         timeout-minutes: 5
         run: |
           for i in 1 2 3; do
-            if npm install --no-save --no-audit --no-fund web-push; then
+            if npm install --no-save --no-audit --no-fund 'web-push@^3.6.7'; then
+              echo "web-push $(node -p "require('./node_modules/web-push/package.json').version")"
               if [ "$i" -gt 1 ]; then
                 echo "::warning::npm install recovered on attempt $i/3"
               fi
