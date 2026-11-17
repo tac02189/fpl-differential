@@ -6,8 +6,8 @@ import { Chip, ErrorNote, Spinner } from '../components/Bits'
 
 const MODES = [
   { id: 'fdr', label: 'FDR', hint: 'Overall fixture difficulty (official FPL ratings).' },
-  { id: 'att', label: 'ATT', hint: 'For your attackers — how leaky each opponent’s defence is, by xG conceded.' },
-  { id: 'def', label: 'DEF', hint: 'For your defence — how dangerous each opponent’s attack is, by xG scored.' },
+  { id: 'att', label: 'ATT', hint: 'For your attackers — how leaky each opponent’s defense is, by xG conceded.' },
+  { id: 'def', label: 'DEF', hint: 'For your defense — how dangerous each opponent’s attack is, by xG scored.' },
 ]
 
 export default function Fixtures() {
